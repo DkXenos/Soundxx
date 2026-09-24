@@ -1,0 +1,8 @@
+# Verified on Python 3.11.16, macOS 26 (Darwin 25.5), Apple M3.
+# sounddevice's macOS wheel bundles its own PortAudio build.
+numpy==2.2.6
+sounddevice==0.5.6
+
+# Phase 2/3 add torch, speechbrain, silero-vad, onnxruntime and textual. They
+# get pinned here only after they've been installed and smoke-tested on this
+# machine.
