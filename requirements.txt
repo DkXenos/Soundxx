@@ -1,8 +1,53 @@
-# Verified on Python 3.11.16, macOS 26 (Darwin 25.5), Apple M3.
-# sounddevice's macOS wheel bundles its own PortAudio build.
+# Verified on Python 3.11.16, macOS 26 (Darwin 25.5), Apple M3 (8 GB).
 numpy==2.2.6
-sounddevice==0.5.6
+sounddevice==0.5.6      # bundles its own PortAudio on macOS
+soxr==1.1.0             # streaming resampler: stream rate -> 16 kHz for the models
+onnxruntime==1.30.0     # runs the vendored silero-vad model (stage 1)
+torch==2.11.0           # speaker model (stage 3); MPS on Apple Silicon
+torchaudio==2.11.0      # must match torch's version; speechbrain needs it
+speechbrain==1.1.1      # ECAPA-TDNN speaker embeddings (1.1+ supports torchaudio 2.9+)
+textual==8.2.8          # interactive UI (stage 4)
 
-# Phase 2/3 add torch, speechbrain, silero-vad, onnxruntime and textual. They
-# get pinned here only after they've been installed and smoke-tested on this
-# machine.
+# Pulled in by the above; pinned so installs stay reproducible.
+anyio==4.15.1
+certifi==2026.7.22
+cffi==2.1.1
+charset-normalizer==3.5.1
+click==8.5.0
+cloudpickle==3.1.2
+filelock==4.0.3
+flatbuffers==25.12.19
+fsspec==2026.9.0
+h11==0.16.0
+hf-xet==1.6.0
+httpcore==1.0.9
+httpx==0.28.1
+huggingface_hub==1.32.0
+HyperPyYAML==1.2.3
+idna==3.20
+Jinja2==3.1.6
+joblib==1.6.0
+linkify-it-py==2.2.0
+markdown-it-py==4.2.0
+MarkupSafe==3.0.3
+mdit-py-plugins==0.6.1
+mdurl==0.1.2
+mpmath==1.3.0
+networkx==3.6.1
+packaging==26.3
+platformdirs==4.11.12
+protobuf==7.36.2
+pycparser==3.0
+Pygments==2.21.0
+PyYAML==6.0.3
+requests==2.34.2
+rich==15.0.0
+ruamel.yaml==0.18.17
+ruamel.yaml.clib==0.2.15
+scipy==1.17.1
+sentencepiece==0.2.2
+soundfile==0.14.0
+sympy==1.14.0
+tqdm==4.70.1
+typing_extensions==4.16.0
+urllib3==2.8.0

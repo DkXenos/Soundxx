@@ -264,9 +264,12 @@ class AudioEngine:
 
     def __init__(self, cfg: Config):
         self.cfg = cfg
-        fs = cfg.samplerate
-        self.in_ring = RingBuffer(2 * fs)
-        self.out_ring = RingBuffer(2 * fs)
+        # Stream rate and block size, fixed for the session by start(): the
+        # configured rate, or else the mic's native rate so neither stream
+        # needs CoreAudio resampling and playback keeps its full bandwidth.
+        self.samplerate = 0
+        self.blocksize = 0
+        self.in_ring = self.out_ring = RingBuffer(2)  # real rings are sized in start()
         self.stats = AudioStats()
 
         # "stopped" | "running" | "waiting" (a device is missing) | "failed"
@@ -278,8 +281,8 @@ class AudioEngine:
         self._in_query = cfg.input_device
         self._out_query = cfg.output_device
 
-        self._prefill = int(cfg.buffer_ms * fs / 1000)
-        self._drift_slack = 3 * cfg.blocksize
+        self._prefill = 0
+        self._drift_slack = 0
         self._out_primed = False
         self._out_scratch = np.zeros(8192, dtype=np.float32)
         # (ring write index, ADC time of that sample): lets the output side
@@ -302,14 +305,27 @@ class AudioEngine:
         """
         self._stop.clear()
         try:
+            self._configure(list_devices())
             self._open_streams()
         except BaseException:
             self.stop()
             raise
         if self._out_stream is None:
-            log.warning("no output device matches %r yet; waiting for it", self._out_query)
+            outputs = ", ".join(repr(d["name"]) for d in list_devices() if d["outputs"] > 0)
+            log.warning("no output device matches %r yet; waiting for it. Outputs right now: %s "
+                        "(pick one with --output-device)", self._out_query, outputs)
         self._supervisor = threading.Thread(target=self._supervise, name="audio-supervisor", daemon=True)
         self._supervisor.start()
+
+    def _configure(self, devices: list[dict]) -> None:
+        in_idx = find_device(devices, self._in_query, "input")
+        fs = self.samplerate = int(self.cfg.samplerate or devices[in_idx]["samplerate"])
+        self.blocksize = round(fs * self.cfg.block_ms / 1000)
+        self.in_ring = RingBuffer(2 * fs)
+        self.out_ring = RingBuffer(2 * fs)
+        self._prefill = int(self.cfg.buffer_ms * fs / 1000)
+        self._drift_slack = 3 * self.blocksize
+        log.info("streams: %d Hz, %d-sample blocks (%.1f ms)", fs, self.blocksize, 1e3 * self.blocksize / fs)
 
     def stop(self) -> None:
         self._stop.set()
@@ -341,7 +357,7 @@ class AudioEngine:
         k = self.in_ring.read_index
         self.in_ring.read_into(out)
         w0, t0 = self._in_anchor
-        return t0 + (k - w0) / self.cfg.samplerate
+        return t0 + (k - w0) / self.samplerate
 
     def skip_input(self, n: int) -> int:
         return self.in_ring.skip(n)
@@ -381,7 +397,7 @@ class AudioEngine:
 
     def _open_input(self, idx: int) -> sd.InputStream:
         stream = sd.InputStream(
-            device=idx, samplerate=self.cfg.samplerate, blocksize=self.cfg.blocksize,
+            device=idx, samplerate=self.samplerate, blocksize=self.blocksize,
             channels=1, dtype="float32", latency=self.cfg.latency, callback=self._on_input,
         )
         stream.start()
@@ -395,7 +411,7 @@ class AudioEngine:
         stream = sd.OutputStream(
             # blocksize=0 lets CoreAudio pick its own buffer size (Bluetooth
             # devices are picky); the ring absorbs the size mismatch.
-            device=idx, samplerate=self.cfg.samplerate, blocksize=0,
+            device=idx, samplerate=self.samplerate, blocksize=0,
             channels=min(2, max_channels), dtype="float32", latency=self.cfg.latency,
             callback=self._on_output,
         )
@@ -523,6 +539,6 @@ class AudioEngine:
             else:
                 dac = now + st.out_latency
             w0, t0 = anchor
-            st.e2e_sum += dac - (t0 + (r - w0) / self.cfg.samplerate)
+            st.e2e_sum += dac - (t0 + (r - w0) / self.samplerate)
             st.e2e_count += 1
             st.out_device_latency = dac - now
