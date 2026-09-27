@@ -213,6 +213,12 @@ class SpeakerTracker:
         self._last: Assignment | None = None
         self._embeddings = 0
         self._events: deque[str] = deque(maxlen=20)
+        # Embedding quality, for comparing --denoise-scope settings: how close
+        # each voiceprint was to the speaker it matched, and how often one
+        # matched nobody and founded a new cluster. Only increase.
+        self.match_sim_sum = 0.0
+        self.matches = 0
+        self.clusters_founded = 0
 
     # Worker side ---------------------------------------------------------
     def observe(self, embedding: np.ndarray, now: float) -> int | None:
@@ -224,6 +230,11 @@ class SpeakerTracker:
             c.prune(now, protected)
             self._last = a
             self._embeddings += 1
+            if a.created:
+                self.clusters_founded += 1
+            elif a.similarities:
+                self.match_sim_sum += max(a.similarities.values())
+                self.matches += 1
             s = c.speakers.get(a.speaker_id)
             if s is None or not c.confirmed(s):
                 return None
@@ -282,6 +293,14 @@ class SpeakerTracker:
                 speakers=views, selected_label=selected.label if selected else None,
                 unconfirmed=len(c.speakers) - len(shown), last_similarities=sims,
                 last_assigned=assigned, threshold=c.threshold, embeddings=self._embeddings)
+
+    def label(self, speaker_id: int | None) -> str | None:
+        """Current label of a speaker, also after they've been merged away or forgotten."""
+        if speaker_id is None:
+            return None
+        with self._lock:
+            s = self.clusterer.speakers.get(speaker_id)
+            return s.label if s is not None else f"Speaker {speaker_id}"
 
     def drain_events(self) -> list[str]:
         with self._lock:

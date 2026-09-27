@@ -1,13 +1,17 @@
-"""Stage 4: the interactive terminal UI (Textual).
+"""Stage 4: the interactive terminal UI (Textual), with the Stage 5 transcript panel.
 
 Runs on the main thread and never touches audio. Ten times a second it reads
 a SpeakerTracker snapshot (under the tracker's lock, which no audio callback
-takes) plus a few plain counters. Key presses go back through the tracker's
-methods.
+takes), drains finished transcript lines, and reads a few plain counters.
+Whisper runs on its own thread, so the meters keep moving while it works.
+Key presses go back through the tracker's methods.
 """
 from __future__ import annotations
 
+import asyncio
 import logging
+import signal
+import time
 from typing import TYPE_CHECKING
 
 from rich.markup import escape
@@ -15,14 +19,18 @@ from rich.table import Table
 from rich.text import Text
 from textual.app import App, ComposeResult
 from textual.binding import Binding
-from textual.widgets import Footer, Input, Static
+from textual.css.query import NoMatches
+from textual.widgets import Footer, Input, RichLog, Static
 
+from .health import format_conditioning, health_line
 from .pipeline import MIC_SILENT_HINT
+from .transcript import clock
 
 if TYPE_CHECKING:
     from .clustering import TrackerSnapshot
     from .main import Session
     from .pipeline import MetricsSnapshot
+    from .transcript import TranscriptLine
 
 log = logging.getLogger(__name__)
 
@@ -46,6 +54,9 @@ class FocusEarApp(App):
     CSS = """
     #header { height: auto; padding: 0 1; background: $panel; }
     #speakers { height: 1fr; padding: 1 1 0 1; }
+    Screen.-transcript #speakers { height: auto; max-height: 14; }
+    #asr-status { height: 1; padding: 0 1; background: $panel; }
+    #transcript { height: 1fr; padding: 0 1; scrollbar-size-vertical: 1; }
     #debug { height: auto; padding: 0 1; border-top: solid $accent; }
     #name { margin: 0 1; }
     """
@@ -55,6 +66,7 @@ class FocusEarApp(App):
         Binding("0", "select(0)", "Everyone"),
         Binding("n", "name", "Name speaker"),
         Binding("r", "reset", "Reset"),
+        Binding("t", "toggle_transcript", "Transcript"),
         Binding("d", "toggle_debug", "Debug"),
         Binding("q", "quit", "Quit"),
         Binding("ctrl+c", "quit", show=False, priority=True),
@@ -65,10 +77,14 @@ class FocusEarApp(App):
         super().__init__()
         self.session = session
         self.metrics: MetricsSnapshot | None = None
+        self.health = ""
+        self._next_clip_notice = 0.0
 
     def compose(self) -> ComposeResult:
         yield Static(id="header")
         yield Static(id="speakers")
+        yield Static(id="asr-status")
+        yield RichLog(id="transcript", wrap=True, max_lines=1000, auto_scroll=True)
         yield Static(id="debug")
         yield Input(id="name")
         yield Footer()
@@ -76,6 +92,14 @@ class FocusEarApp(App):
     def on_mount(self) -> None:
         self.query_one("#debug").display = self.session.cfg.debug
         self.query_one("#name").display = False
+        self.show_transcript(self.session.transcriber is not None)
+        # Closing the terminal or `kill` quits like q, so the transcript gets flushed and closed.
+        loop = asyncio.get_running_loop()
+        for sig in (signal.SIGTERM, signal.SIGHUP):
+            try:
+                loop.add_signal_handler(sig, self.exit)
+            except (NotImplementedError, RuntimeError, ValueError):
+                pass
         self.set_interval(0.1, self.refresh_view)
         self.set_interval(1.0, self.refresh_metrics)
         self.refresh_view()
@@ -134,6 +158,20 @@ class FocusEarApp(App):
             self.session.tracker.reset()
             self.notify("Speakers reset (saved speakers kept)", timeout=2)
 
+    def show_transcript(self, show: bool) -> None:
+        self.query_one("#asr-status").display = show
+        self.query_one("#transcript").display = show
+        self.screen.set_class(show, "-transcript")
+
+    def action_toggle_transcript(self) -> None:
+        s = self.session
+        if s.transcriber is None:
+            why = f"it failed to start: {s.asr_error}" if s.asr_error else "--no-transcribe"
+            self.notify(f"Transcription is off ({why})", severity="warning")
+            return
+        self.show_transcript(not self.query_one("#transcript").display)
+        self.refresh_view()
+
     def action_toggle_debug(self) -> None:
         debug = self.query_one("#debug")
         debug.display = not debug.display
@@ -141,10 +179,33 @@ class FocusEarApp(App):
 
     # Refresh -------------------------------------------------------------
     def refresh_metrics(self) -> None:
+        try:
+            self._refresh_metrics()
+        except NoMatches:
+            pass  # a timer tick during shutdown, after the widgets are gone
+
+    def _refresh_metrics(self) -> None:
         self.metrics = self.session.metrics.snapshot()
         self.session.log_metrics(self.metrics)
+        clips = self.metrics.clips
+        now = time.monotonic()
+        if (clips.get("output") or clips.get("mic")) and now >= self._next_clip_notice:
+            self._next_clip_notice = now + 10.0
+            where = "the mic is clipping (too loud at the source)" if clips.get("mic") else "the output clipped"
+            self.notify(f"⚠ {where}; see the log", severity="warning", timeout=5)
+        if self.query_one("#debug").display:
+            try:
+                self.health = health_line(self.session)
+            except Exception as exc:  # noqa: BLE001 - diagnostics must never take the UI down
+                self.health = f"unavailable ({type(exc).__name__}: {exc})"
 
     def refresh_view(self) -> None:
+        try:
+            self._refresh_view()
+        except NoMatches:
+            pass  # a timer tick during shutdown, after the widgets are gone
+
+    def _refresh_view(self) -> None:
         s = self.session
         if s.engine.error is not None:
             self.exit(return_code=2, message=f"focus-ear: {s.engine.error}")
@@ -156,6 +217,13 @@ class FocusEarApp(App):
             snap = s.tracker.snapshot()
         self.query_one("#header", Static).update(self.render_header(snap))
         self.query_one("#speakers", Static).update(self.render_speakers(snap))
+        if s.transcriber is not None:
+            log_widget = self.query_one("#transcript", RichLog)
+            for line in s.transcriber.drain_lines():  # also while hidden, so it's current when shown
+                log_widget.write(self.render_line(line))
+            status = self.query_one("#asr-status", Static)
+            if status.display:
+                status.update(self.render_asr_status())
         debug = self.query_one("#debug", Static)
         if debug.display:
             debug.update(self.render_debug(snap))
@@ -173,9 +241,15 @@ class FocusEarApp(App):
         embed_drops = s.analyzer.dropped if s.analyzer is not None else 0
         line1 = (f"[b]{escape(engine.input_name or '?')}[/] → {out}   latency {latency}   "
                  f"drops: audio {pipe.drop_events} · embeddings {embed_drops}")
+        if s.transcriber is not None:
+            line1 += f" · transcripts {s.transcriber.dropped}"
+        elif s.asr_error:
+            line1 += "   [b red]transcription failed to start[/]"
 
         if pipe.mic_silent:
             return Text.from_markup(f"{line1}\n[b red]⚠ {escape(MIC_SILENT_HINT)}[/]")
+        if getattr(pipe, "errors", 0):
+            line1 += f"\n[b red]⚠ processing failed {pipe.errors}× ({escape(pipe.last_error or '')}); playing unprocessed[/]"
         ctx = pipe.ctx
         speech = "[b green]SPEECH [/]" if ctx is not None and ctx.is_speech else "[dim]silence[/]"
         if s.gate is None:
@@ -190,7 +264,13 @@ class FocusEarApp(App):
             focus = "focus: [b]everyone[/] (passthrough)"
         else:
             focus = f"focus: [b]{escape(snap.selected_label)}[/], others {cfg.attenuation_db:g} dB"
-        line2 = f"mic {pipe.in_db:4.0f} dB   {speech}   {gate}   {focus}"
+        cond = []
+        if getattr(s, "denoiser", None) is not None:
+            cond.append(f"denoise {pipe.denoise_scope}")
+        if getattr(s, "agc", None) is not None:
+            cond.append(f"agc {s.agc.gain_db:+.0f} dB")
+        cond = f"   [dim]{' · '.join(cond)}[/]" if cond else ""
+        line2 = f"mic {pipe.in_db:4.0f} dB   {speech}   {gate}   {focus}{cond}"
         return Text.from_markup(f"{line1}\n{line2}")
 
     def render_speakers(self, snap: TrackerSnapshot | None) -> Table | Text:
@@ -219,6 +299,24 @@ class FocusEarApp(App):
             table.caption = f"+{snap.unconfirmed} unconfirmed (heard fewer than {self.session.cfg.min_sightings} times)"
         return table
 
+    @staticmethod
+    def render_line(line: TranscriptLine) -> Text:
+        return Text.assemble(
+            (f"{clock(line.start)} ", "dim"), (f"{line.speaker}: " if line.speaker else "", "bold"),
+            (line.display_text, "dim italic" if line.garbled else ""))
+
+    def render_asr_status(self) -> Text:
+        s = self.session
+        tr, seg = s.transcriber, s.segmenter
+        parts: list[tuple[str, str] | str] = [("Transcript", "bold")]
+        writer = tr.writer
+        parts.append((f" → {writer.md_path.name}" if writer is not None else " (not saved: --no-save)", "dim"))
+        if seg is not None and seg.recording_s > 0:
+            parts.append(("   ● listening", "red"))
+        if tr.pending:
+            parts.append((f"   ⋯ transcribing{f' ({tr.pending})' if tr.pending > 1 else ''}", "yellow"))
+        return Text.assemble(*parts)
+
     def render_debug(self, snap: TrackerSnapshot | None) -> Text:
         s, m = self.session, self.metrics
         lines = []
@@ -243,6 +341,18 @@ class FocusEarApp(App):
                              for label, v in snap.last_similarities[:6]) or "-"
             lines.append(f"last embedding → {snap.last_assigned or '-'}   cosine: {sims}   "
                          f"(threshold {snap.threshold:.2f})")
+        conditioning = format_conditioning(s)
+        if conditioning:
+            lines.append(conditioning.removeprefix(" | ").replace(" | ", " · "))
+        if self.health:
+            lines.append(f"health: {self.health}")
+        tr, seg = s.transcriber, s.segmenter
+        if tr is not None and seg is not None:
+            rtf = tr.last_processing_s / tr.last_audio_s if tr.last_audio_s else 0.0
+            lines.append(f"asr {tr.description}: last {tr.last_processing_s:.2f} s for {tr.last_audio_s:.1f} s "
+                         f"(RTF {rtf:.2f}) · {tr.done} done · {tr.pending} pending · {tr.dropped} dropped "
+                         f"(queue full) · {tr.failed} failed · discarded: {seg.too_short} too short, "
+                         f"{seg.other_speaker} other speakers")
         return Text("\n".join(lines) or "collecting…")
 
 

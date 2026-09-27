@@ -1,11 +1,17 @@
 """Run with: venv/bin/python -m unittest discover -s tests"""
+import logging
 import threading
 import time
+import types
 import unittest
+from unittest import mock
 
 import numpy as np
 
-from focus_ear.audio_io import DeviceError, RingBuffer, check_device_pair, find_device
+from focus_ear import audio_io
+from focus_ear.audio_io import AudioEngine, DeviceError, RingBuffer, check_device_pair, find_device
+from focus_ear.config import Config
+from focus_ear.pipeline import Pipeline
 
 
 class RingBufferTest(unittest.TestCase):
@@ -96,6 +102,117 @@ class DeviceTest(unittest.TestCase):
         check_device_pair("MacBook Pro Microphone", "MacBook Pro Speakers", allow_speakers=True)
         with self.assertRaises(DeviceError):
             check_device_pair("Jaysn's Galaxy Buds2 Pro", "Jaysn's Galaxy Buds2 Pro", allow_speakers=False)
+
+
+class FakeSoundDevice:
+    """Just enough of sounddevice for AudioEngine: devices come and go, streams tick on threads."""
+
+    class PortAudioError(Exception):
+        pass
+
+    def __init__(self):
+        self.buds_awake = True
+        self.fail_next_open = False
+        self.reinits = 0
+        self.streams = []
+        fake = self
+
+        class Stream:
+            def __init__(self, device, samplerate, blocksize, channels, dtype, latency, callback):
+                if fake.fail_next_open and self.kind == "output":
+                    fake.fail_next_open = False
+                    raise fake.PortAudioError("Bluetooth link not ready")
+                self.frames = blocksize or 512
+                self.channels, self.callback = channels, callback
+                self.active, self.closed, self.latency = False, False, 0.01
+                self.device_name = fake.query_devices()[device]["name"]
+                fake.streams.append(self)
+
+            def start(self):
+                self.active = True
+                threading.Thread(target=self._tick, daemon=True).start()
+
+            def _tick(self):
+                info = types.SimpleNamespace(inputBufferAdcTime=0, outputBufferDacTime=0, currentTime=0)
+                status = types.SimpleNamespace(input_overflow=False, output_underflow=False)
+                buf = np.zeros((self.frames, self.channels), np.float32)
+                while not self.closed:
+                    time.sleep(self.frames / 16000)
+                    # A sleeping Bluetooth device just stops calling back; the stream still looks active.
+                    if "Buds" in self.device_name and not fake.buds_awake:
+                        continue
+                    if self.kind == "input":
+                        buf[:] = 0.01
+                    self.callback(buf, self.frames, info, status)
+
+            def close(self, ignore_errors=True):
+                self.closed, self.active = True, False
+
+        self.InputStream = type("InputStream", (Stream,), {"kind": "input"})
+        self.OutputStream = type("OutputStream", (Stream,), {"kind": "output"})
+
+    def query_devices(self):
+        devices = [{"name": "MacBook Pro Microphone", "max_input_channels": 1, "max_output_channels": 0,
+                    "default_samplerate": 16000.0}]
+        if self.buds_awake:
+            devices.append({"name": "Mewo Buds", "max_input_channels": 1, "max_output_channels": 2,
+                            "default_samplerate": 16000.0})
+        return devices
+
+    def _terminate(self):
+        pass
+
+    def _initialize(self):
+        self.reinits += 1
+
+
+class FastEngine(AudioEngine):
+    STALE_S, OPEN_GRACE_S, PROBE_INTERVAL_S, POLL_S = 0.15, 0.1, 0.05, 0.02
+
+
+class ReconnectTest(unittest.TestCase):
+    """The Buds sleeping in their case is routine: the engine waits, then resumes, every time."""
+
+    def wait_for(self, cond, timeout=5.0):
+        deadline = time.monotonic() + timeout
+        while not cond() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        return cond()
+
+    def test_buds_sleep_and_wake_repeatedly_without_crashing(self):
+        sd = FakeSoundDevice()
+        probe = lambda timeout=5.0: [{"name": d["name"], "inputs": d["max_input_channels"],  # noqa: E731
+                                      "outputs": d["max_output_channels"]} for d in sd.query_devices()]
+        with mock.patch.object(audio_io, "sd", sd), mock.patch.object(audio_io, "probe_devices", probe), \
+                self.assertLogs("focus_ear.audio_io", logging.INFO) as logs:
+            engine = FastEngine(Config(output_device="Mewo"))
+            engine.start()
+            pipe = Pipeline(engine, Config())
+            pipe.start()
+            try:
+                self.assertTrue(self.wait_for(lambda: engine.state == "running"))
+                threads = threading.active_count()
+                for cycle in range(10):
+                    sd.buds_awake = False
+                    self.assertTrue(self.wait_for(lambda: engine.state == "waiting"), f"cycle {cycle}")
+                    blocks = pipe.blocks
+                    self.assertTrue(self.wait_for(lambda: pipe.blocks > blocks + 3),
+                                    "the mic keeps feeding the analysis while the Buds are away")
+                    sd.fail_next_open = cycle == 3  # listed before the link is ready: retried
+                    sd.buds_awake = True
+                    self.assertTrue(self.wait_for(lambda: engine.state == "running"), f"cycle {cycle}")
+                    self.assertTrue(self.wait_for(lambda: engine.stats.out_heartbeat > time.monotonic() - 0.05))
+                self.assertIsNone(engine.error)
+                self.assertEqual(engine.stats.reconnects, 10)
+                self.assertLessEqual(threading.active_count(), threads + 2)  # no thread pile-up
+            finally:
+                pipe.stop()
+                engine.stop()
+        text = "\n".join(logs.output)
+        self.assertIn("is back after", text)
+        self.assertIn("will retry", text)
+        live = [s for s in sd.streams if not s.closed]
+        self.assertEqual(live, [])  # every stream was closed
 
 
 if __name__ == "__main__":

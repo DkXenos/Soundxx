@@ -205,7 +205,10 @@ def _reinit_portaudio() -> None:
     # sounddevice has no public way to refresh the device list. Pa_Terminate()
     # followed by Pa_Initialize() is the only way to pick up hot-plugged
     # devices, and it invalidates every open stream, so close them first.
-    sd._terminate()
+    try:
+        sd._terminate()
+    except sd.PortAudioError:
+        pass  # a previous _initialize() failed: nothing to terminate
     sd._initialize()
 
 
@@ -254,6 +257,7 @@ class AudioStats:
     out_device_latency: float = 0.0  # DAC time minus callback time, last seen
     e2e_sum: float = 0.0          # mic ADC to buds DAC, summed per callback
     e2e_count: int = 0
+    reconnects: int = 0           # times the output came back after going away
 
 
 class AudioEngine:
@@ -296,6 +300,7 @@ class AudioEngine:
         self._supervisor: threading.Thread | None = None
         self._grace_until = 0.0
         self._next_probe = 0.0
+        self._lost_at: float | None = None  # when the output went away
 
     # Lifecycle -----------------------------------------------------------
     def start(self) -> None:
@@ -392,7 +397,13 @@ class AudioEngine:
         if self._out_stream is None:
             self._out_stream = self._open_output(out_idx, devices[out_idx]["outputs"])
             self.output_name = self._out_query = devices[out_idx]["name"]
-            log.info("output: #%d %s", out_idx, self.output_name)
+            if self._lost_at is not None:
+                self.stats.reconnects += 1
+                log.info("output: #%d %s is back after %.0f s", out_idx, self.output_name,
+                         time.monotonic() - self._lost_at)
+                self._lost_at = None
+            else:
+                log.info("output: #%d %s", out_idx, self.output_name)
         self.state = "running"
 
     def _open_input(self, idx: int) -> sd.InputStream:
@@ -444,6 +455,7 @@ class AudioEngine:
             log.warning("output %r stopped (asleep or disconnected); waiting for it", self.output_name)
             self._close_dead(self._out_stream)
             self._out_stream = None
+            self._lost_at = now
             self.state = "waiting"
         if self._in_stream is not None and (
                 not self._in_stream.active or now - st.in_heartbeat > self.STALE_S):

@@ -92,7 +92,8 @@ class FakeEngine:
 class WorkerTest(unittest.TestCase):
     def test_falling_behind_drops_old_audio_instead_of_adding_latency(self):
         engine = FakeEngine()
-        engine.in_ring.write(np.arange(10 * BLOCK, dtype=np.float32))  # 320 ms behind
+        ramp = np.arange(10 * BLOCK, dtype=np.float32) / (10 * BLOCK)  # below full scale: the output is clamped there
+        engine.in_ring.write(ramp)  # 320 ms behind
         pipe = Pipeline(engine, Config(max_backlog_ms=100))
         pipe.start()
         time.sleep(0.2)
@@ -102,7 +103,30 @@ class WorkerTest(unittest.TestCase):
         self.assertEqual(pipe.blocks, 1)
         played = np.zeros(BLOCK, np.float32)
         engine.out_ring.read_into(played)
-        np.testing.assert_array_equal(played, np.arange(9 * BLOCK, 10 * BLOCK))  # the newest block
+        np.testing.assert_array_equal(played, ramp[9 * BLOCK:])  # the newest block
+
+    def test_a_failing_stage_plays_the_audio_unprocessed_instead_of_killing_the_worker(self):
+        class Broken:
+            name, delay_samples = "broken", 0
+
+            def process(self, block, ctx):
+                raise RuntimeError("model exploded")
+
+        engine = FakeEngine()
+        pipe = Pipeline(engine, Config(max_backlog_ms=1000), stages=[Broken()])
+        signal = np.linspace(-0.5, 0.5, 4 * BLOCK, dtype=np.float32)
+        with self.assertLogs("focus_ear.pipeline", "ERROR"):
+            pipe.start()
+            engine.in_ring.write(signal)
+            deadline = time.monotonic() + 2
+            while pipe.errors < 4 and time.monotonic() < deadline:
+                time.sleep(0.01)
+            pipe.stop()
+        self.assertEqual(pipe.errors, 4)
+        self.assertIn("model exploded", pipe.last_error)
+        played = np.zeros(4 * BLOCK, np.float32)
+        engine.out_ring.read_into(played)
+        np.testing.assert_array_equal(played, signal)
 
 
 if __name__ == "__main__":

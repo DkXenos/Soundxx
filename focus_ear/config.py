@@ -7,6 +7,16 @@ from pathlib import Path
 ANALYSIS_RATE = 16_000  # silero-vad and ECAPA-TDNN both expect 16 kHz mono
 ANALYSIS_FRAME = 512    # 32 ms at 16 kHz: silero-vad's frame size
 DATA_DIR = Path.home() / ".focus-ear"
+SESSIONS_DIR = DATA_DIR / "sessions"
+
+# Whisper continues the style of its prompt: spoken, code-mixed Indonesian
+# with English technical terms left in English. Measured on synthesised
+# code-mixed lecture speech (README), this sentence raised the average
+# logprob on every clip. A keyword-list prompt was parroted back verbatim
+# on noise; this one returned nothing there, where no prompt at all
+# hallucinated "Terima kasih."
+DEFAULT_PROMPT = ("Oke, jadi di kuliah ini kita pakai Python. Kita define function dulu, terus kita pakai "
+                  "for loop, lalu return value-nya.")
 
 
 @dataclass
@@ -27,6 +37,23 @@ class Config:
     # mic, it drops audio to catch up instead of letting latency grow.
     buffer_ms: float = 64.0
     max_backlog_ms: float = 100.0
+
+    # Input conditioning, before everything else
+    highpass_hz: float = 80.0       # 0 = off
+    denoise: bool = True            # DeepFilterNet3
+    denoise_mix: float = 1.0        # 1 = fully denoised, 0 = original
+    # Who hears the denoised audio: "all" | "playback" | "models". "playback"
+    # because on synthesised code-mixed lecture speech in noise (README),
+    # denoising what the models hear wrecked Whisper (avg logprob -0.90 ->
+    # -4.05) and merged the student into the lecturer (5 clusters -> 1).
+    denoise_scope: str = "playback"
+    latency_budget_ms: float = 500.0
+
+    # Output conditioning, last before the Buds
+    agc: bool = True
+    agc_target_db: float = -23.0    # speech level (RMS, dBFS) the AGC aims for
+    limiter: bool = True
+    limiter_ceiling_db: float = -6.0  # no sample goes above this
 
     # Stage 1: voice activity detection
     vad_threshold: float = 0.5
@@ -57,6 +84,18 @@ class Config:
     boost_db: float = 0.0
     attenuation_db: float = -20.0
     lookahead_ms: float = 250.0
+
+    # Stage 5: transcription of the selected speaker (everyone while none is selected)
+    transcribe: bool = True
+    asr_model: str = "mlx-community/whisper-small-mlx"
+    language: str = "id"            # a Whisper language code, or "auto"
+    initial_prompt: str = DEFAULT_PROMPT
+    utterance_gap_ms: float = 800.0
+    max_utterance_s: float = 20.0
+    preroll_ms: float = 300.0
+    min_utterance_ms: float = 400.0
+    asr_queue: int = 4              # utterances waiting for Whisper before the oldest is dropped
+    save: bool = True               # write ~/.focus-ear/sessions/*.md and *.jsonl
 
     tui: bool = True
     debug: bool = False

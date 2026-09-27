@@ -1,0 +1,14 @@
+# Noise suppression (DeepFilterNet3). Optional: without it, --denoise is off.
+#
+# Install AFTER requirements.txt, and with --no-deps:
+#     pip install --no-deps -r requirements-denoise.txt
+#
+# deepfilternet 0.5.6's metadata pins numpy<2 and packaging<24, which would
+# downgrade the rest of the stack. It works with numpy 2 (tests/test_denoise.py
+# checks the streaming model against the package's own offline output), so its
+# pins are skipped; its real runtime dependencies are listed here instead.
+# `pip check` will still report the metadata conflict; that's expected.
+deepfilternet==0.5.6    # the model (DeepFilterNet3, ~8 MB, downloaded to ~/Library/Caches on first use)
+deepfilterlib==0.5.6    # its STFT and ERB features (Rust)
+loguru==0.7.3
+appdirs==1.4.4

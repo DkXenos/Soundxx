@@ -1,20 +1,38 @@
 """Worker thread: mic ring -> analysis + processing chain -> buds ring, plus metrics.
 
 All heavy work runs here, never in an audio callback. Each block (~32 ms at
-the stream rate) goes through two paths:
+the stream rate) is conditioned, then goes through two paths.
 
-  analysis  block -> 16 kHz resampler -> 512-sample frames -> FrameAnalyzers
-            (Stage 1 VAD; Stage 3 speaker embeddings) which annotate the
-            block's BlockContext
-  audio     block -> AudioStages (Stage 2 noise gate; Stage 4 speaker gain)
-            which read the context and change the audio -> output ring
+Sample rates. "Stream rate" is the mic's native rate, 44.1 kHz on a MacBook;
+both PortAudio streams run at it, so CoreAudio never resamples.
+
+  mic 44.1k ─► high-pass 80 Hz (44.1k) ─► raw ──┬─────────────────────────────────────────────────────────► raw
+                                                 └─► polyphase ─► 48k ─► DeepFilterNet3 ─► 48k ─► polyphase ─► 44.1k ─► denoised
+                                                     (10 ms frames at 48 kHz; the whole detour is a fixed 41 ms at 44.1 kHz)
+
+  --denoise-scope    analysis (VAD, embeddings, Whisper)    playback
+  all                denoised                                denoised
+  playback           raw, undelayed                          denoised
+  models             denoised                                raw, delayed 41 ms to stay in step
+
+  analysis  44.1k ─► soxr ─► 16k ─► 512-sample frames ─► FrameAnalyzers
+            (Stage 1 VAD; Stage 3 speaker embeddings) annotate the block's
+            BlockContext; then Stage 5's utterance segmenter reads those
+            annotations and hands 16 kHz utterances to the ASR thread
+  playback  44.1k ─► AudioStages (Stage 2 gate; Stage 4 speaker gain; AGC;
+            limiter), which read the context ─► clip check ─► output ring ─► Buds, 44.1k
+
+Under "playback" the models hear each sound 41 ms before the Buds play it,
+which works like free lookahead for the gate. Under "models" the raw audio
+is delayed by the denoiser's delay so decisions still land on the audio they
+were made from; so every scope adds the same latency.
 
 Extension points, deliberately not implemented yet:
-  * Noise suppression: an AudioStage ahead of the gate.
   * Overlapping-speech separation: an AudioStage that replaces gating and
     returns only the selected speaker's separated signal.
-  * Transcription: an AudioTap. It sees every processed block plus its
-    BlockContext (speaker label included), and does its work off-thread.
+  * Anything that needs the processed (gated, attenuated) audio: an AudioTap.
+    Transcription is a FrameAnalyzer instead, because Whisper wants the
+    16 kHz speech, not what the buds hear.
 """
 from __future__ import annotations
 
@@ -31,6 +49,8 @@ import numpy as np
 import soxr
 
 from .config import ANALYSIS_FRAME, ANALYSIS_RATE, Config
+from .dsp import ClipMeter
+from .gain import DelayLine
 
 if TYPE_CHECKING:
     from .audio_io import AudioEngine, AudioStats
@@ -141,18 +161,38 @@ def _db(x: float) -> float:
 class Pipeline:
     SILENT_MIC_WARN_S = 2.0
 
+    SCOPES = ("all", "playback", "models")
+
     def __init__(self, engine: AudioEngine, cfg: Config, analyzers: list[FrameAnalyzer] | None = None,
-                 stages: list[AudioStage] | None = None, taps: list[AudioTap] | None = None):
-        """Create after engine.start(): the stream rate is only known then."""
+                 stages: list[AudioStage] | None = None, taps: list[AudioTap] | None = None,
+                 highpass: AudioStage | None = None, denoiser: AudioStage | None = None,
+                 denoise_scope: str = "all"):
+        """Create after engine.start(): the stream rate is only known then.
+
+        ``highpass`` and ``denoiser`` condition the input before both paths
+        (see the module docstring); either may be None.
+        """
+        if denoise_scope not in self.SCOPES:
+            raise ValueError(f"denoise_scope must be one of {self.SCOPES}")
         self.engine = engine
         self.cfg = cfg
         self.analyzers = list(analyzers or [])
         self.stages = list(stages or [])
         self.taps = list(taps or [])
+        self.highpass = highpass
+        self.denoiser = denoiser
+        self.denoise_scope = denoise_scope
+        self._raw_delay = (DelayLine(denoiser.delay_samples)
+                           if denoiser is not None and denoise_scope == "models" else None)
         self.timer = StageTimer()
         self._feed = AnalysisFeed(engine.samplerate)
-        # Total lookahead delay of the stages: output samples were captured this much earlier.
-        self.delay_samples = sum(getattr(stage, "delay_samples", 0) for stage in self.stages)
+        # Total delay of the playback path: output samples were captured this much earlier.
+        self.delay_samples = (sum(getattr(stage, "delay_samples", 0) for stage in self.stages)
+                              + (denoiser.delay_samples if denoiser is not None else 0))
+        # Where full scale is checked. Only "output" is real clipping (the DAC
+        # can't go past 1.0, so it gets clamped there); the rest say where it started.
+        self.clips = {name: ClipMeter(name, limit) for name, limit in
+                      (("mic", 0.999), ("denoise", 1.0), ("output", 1.0))}
         self._ctx = BlockContext(index=-1, adc_time=0.0, samplerate=engine.samplerate)
 
         # Written by the worker, read by UI/metrics. Counters only increase.
@@ -166,6 +206,8 @@ class Pipeline:
         self.drop_events = 0
         self.backlog_sum = 0        # input ring fill at each read, for the mean
         self.heard_signal = False   # any non-zero sample yet?
+        self.errors = 0             # blocks a stage failed on (played unprocessed)
+        self.last_error: str | None = None
 
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
@@ -216,7 +258,15 @@ class Pipeline:
             t_start = time.perf_counter()
             adc_time = engine.read_input(block)
             self.backlog_sum += backlog
-            out = self.process_block(block, adc_time)
+            raw = block.copy()
+            try:
+                out = self.process_block(block, adc_time)
+            except Exception as exc:  # noqa: BLE001 - a broken stage must not silence the audio
+                self.errors += 1
+                self.last_error = f"{type(exc).__name__}: {exc}"
+                if self.errors == 1:
+                    log.exception("processing failed; playing the audio unprocessed while it keeps failing")
+                out = np.clip(raw, -1.0, 1.0)
             engine.write_output(out, adc_time - self.delay_samples / engine.samplerate)
             self.timer.add("total", time.perf_counter() - t_start)
 
@@ -229,10 +279,29 @@ class Pipeline:
         timer = self.timer
         self.heard_signal = self.heard_signal or bool(block.any())
         self.in_db = _db(float(np.sqrt(np.mean(block * block))))
+        self.clips["mic"].check(block)
         ctx = self._ctx = dataclasses.replace(self._ctx, index=self.blocks, adc_time=adc_time)
 
+        raw = block
+        if self.highpass is not None:
+            t = time.perf_counter()
+            raw = self.highpass.process(raw, ctx)
+            timer.add(self.highpass.name, time.perf_counter() - t)
+        analysis = playback = raw
+        if self.denoiser is not None:
+            t = time.perf_counter()
+            denoised = self.denoiser.process(raw, ctx)
+            timer.add(self.denoiser.name, time.perf_counter() - t)
+            self.clips["denoise"].check(denoised)
+            scope = self.denoise_scope
+            analysis = raw if scope == "playback" else denoised
+            if scope == "models":
+                playback = self._raw_delay.process(raw)
+            else:
+                playback = denoised
+
         t = time.perf_counter()
-        frames = self._feed.push(block)
+        frames = self._feed.push(analysis)
         timer.add("resample", time.perf_counter() - t)
         for frame in frames:
             for analyzer in self.analyzers:
@@ -240,11 +309,13 @@ class Pipeline:
                 analyzer.analyze(frame, ctx)
                 timer.add(analyzer.name, time.perf_counter() - t)
 
-        out = block
+        out = playback
         for stage in self.stages:
             t = time.perf_counter()
             out = stage.process(out, ctx)
             timer.add(stage.name, time.perf_counter() - t)
+        if self.clips["output"].check(out):
+            out = np.clip(out, -1.0, 1.0)  # what the DAC would do anyway; counted and reported
         for tap in self.taps:
             tap.observe(out, ctx)
 
@@ -283,6 +354,7 @@ class MetricsSnapshot:
     out_skipped_ms: float = 0.0
     worker_dropped_ms: float = 0.0
     worker_drop_events: int = 0
+    clips: dict[str, int] = field(default_factory=dict)  # samples at full scale this interval, per point
 
 
 class MetricsCollector:
@@ -298,7 +370,8 @@ class MetricsCollector:
     def _pipeline_counters(self) -> dict[str, float]:
         p = self.pipeline
         return {"blocks": p.blocks, "backlog": p.backlog_sum, "speech": p.speech_blocks,
-                "prob": p.vad_prob_sum, "dropped": p.dropped, "drops": p.drop_events}
+                "prob": p.vad_prob_sum, "dropped": p.dropped, "drops": p.drop_events,
+                **{f"clip_{name}": meter.count for name, meter in p.clips.items()}}
 
     def snapshot(self) -> MetricsSnapshot:
         fs, bs = self.engine.samplerate, self.engine.blocksize
@@ -337,6 +410,7 @@ class MetricsCollector:
             out_skipped_ms=1e3 * (cur.out_skipped - prev.out_skipped) / fs,
             worker_dropped_ms=1e3 * d["dropped"] / fs,
             worker_drop_events=int(d["drops"]),
+            clips={k[5:]: int(v) for k, v in d.items() if k.startswith("clip_") and v},
         )
         self._prev_stats = cur
         self._prev = counters
