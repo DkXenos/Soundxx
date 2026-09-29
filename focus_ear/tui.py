@@ -1,10 +1,11 @@
-"""Stage 4: the interactive terminal UI (Textual), with the Stage 5 transcript panel.
+"""The interactive terminal UI (Textual): speakers in full mode, the A/B switch in listen mode.
 
 Runs on the main thread and never touches audio. Ten times a second it reads
 a SpeakerTracker snapshot (under the tracker's lock, which no audio callback
 takes), drains finished transcript lines, and reads a few plain counters.
 Whisper runs on its own thread, so the meters keep moving while it works.
-Key presses go back through the tracker's methods.
+Key presses go back through the tracker's methods, or set the pipeline's
+processed/raw flag, which the worker crossfades on its next block.
 """
 from __future__ import annotations
 
@@ -23,7 +24,7 @@ from textual.css.query import NoMatches
 from textual.widgets import Footer, Input, RichLog, Static
 
 from .health import format_conditioning, health_line
-from .pipeline import MIC_SILENT_HINT
+from .pipeline import MIC_SILENT_HINT, latency_breakdown
 from .transcript import clock
 
 if TYPE_CHECKING:
@@ -61,6 +62,7 @@ class FocusEarApp(App):
     #name { margin: 0 1; }
     """
     BINDINGS = [
+        Binding("space", "toggle_processing", "A/B: processed ↔ raw", key_display="space"),
         Binding("1", "select(1)", "Select", key_display="1-9"),
         *[Binding(str(k), f"select({k})", show=False) for k in range(2, 10)],
         Binding("0", "select(0)", "Everyone"),
@@ -72,10 +74,12 @@ class FocusEarApp(App):
         Binding("ctrl+c", "quit", show=False, priority=True),
         Binding("escape", "cancel_name", show=False),
     ]
+    SPEAKER_ACTIONS = ("select", "name", "reset")
 
     def __init__(self, session: Session):
         super().__init__()
         self.session = session
+        self.listen = session.cfg.mode == "listen"
         self.metrics: MetricsSnapshot | None = None
         self.health = ""
         self._next_clip_notice = 0.0
@@ -109,7 +113,19 @@ class FocusEarApp(App):
         # While the name box is open, keys type into it instead of driving the app.
         if self.query_one("#name").display and action not in ("quit", "cancel_name"):
             return False
+        # Each mode shows only its own keys: no speakers to pick in listen mode, no A/B in full.
+        if action in self.SPEAKER_ACTIONS:
+            return not self.listen
+        if action == "toggle_processing":
+            return getattr(self.session.pipeline, "ab", False)
         return True
+
+    def action_toggle_processing(self) -> None:
+        pipe = self.session.pipeline
+        pipe.set_processing(not pipe.processing)
+        self.notify("A/B: processed (denoise, gate, level)" if pipe.processing
+                    else "A/B: raw mic, unprocessed (same delay)", timeout=2)
+        self.refresh_view()
 
     def action_select(self, key: int) -> None:
         tracker = self.session.tracker
@@ -235,16 +251,23 @@ class FocusEarApp(App):
             out = f"[green]● {escape(engine.output_name or '')}[/]"
         else:
             out = f"[yellow]○ waiting for {escape(repr(cfg.output_device))} (asleep or disconnected)[/]"
-        latency = f"{m.e2e_ms:.0f} ms" if m is not None and m.e2e_ms is not None else "…"
-        if pipe.delay_samples:
-            latency += f" (incl. {1e3 * pipe.delay_samples / engine.samplerate:.0f} ms lookahead)"
-        embed_drops = s.analyzer.dropped if s.analyzer is not None else 0
-        line1 = (f"[b]{escape(engine.input_name or '?')}[/] → {out}   latency {latency}   "
-                 f"drops: audio {pipe.drop_events} · embeddings {embed_drops}")
+        if m is not None and m.e2e_ms is not None:
+            latency = f"latency [b]{m.e2e_ms:.0f} ms[/] = {escape(latency_breakdown(m))}"
+        else:
+            latency = "latency: measured once audio is playing"
+        line1 = (f"[b]{escape(engine.input_name or '?')}[/] → {out}   "
+                 f"drops: audio {pipe.drop_events} · late blocks undenoised {getattr(pipe, 'denoise_skips', 0)}")
+        if s.analyzer is not None:
+            line1 += f" · embeddings {s.analyzer.dropped}"
         if s.transcriber is not None:
             line1 += f" · transcripts {s.transcriber.dropped}"
         elif s.asr_error:
             line1 += "   [b red]transcription failed to start[/]"
+        rec = getattr(s, "recorder", None)
+        if rec is not None:
+            line1 += (f"   [red]● rec[/] {duration(rec.seconds)}" if rec.error is None
+                      else "   [b red]recording stopped (see log)[/]")
+        line1 += f"\n{latency}"
 
         if pipe.mic_silent:
             return Text.from_markup(f"{line1}\n[b red]⚠ {escape(MIC_SILENT_HINT)}[/]")
@@ -258,6 +281,8 @@ class FocusEarApp(App):
             gate = "gate open" if s.gate.gain_db > -0.5 else f"gate {s.gate.gain_db:.0f} dB"
         if cfg.passthrough:
             focus = "[yellow]--passthrough: audio is not processed[/]"
+        elif getattr(pipe, "ab", False):
+            focus = "[b green]PROCESSED[/]" if pipe.processing else "[b yellow]RAW (unprocessed mic)[/]"
         elif snap is None:
             focus = "speaker detection off"
         elif snap.selected_label is None:
@@ -273,8 +298,32 @@ class FocusEarApp(App):
         line2 = f"mic {pipe.in_db:4.0f} dB   {speech}   {gate}   {focus}{cond}"
         return Text.from_markup(f"{line1}\n{line2}")
 
+    def render_ab(self) -> Text:
+        s = self.session
+        pipe, cfg = s.pipeline, s.cfg
+        delay = 1e3 * pipe.delay_samples / s.engine.samplerate
+        chain = " → ".join(name for name, on in (
+            (f"high-pass {cfg.highpass_hz:g} Hz", cfg.highpass_hz > 0),
+            ("denoise", getattr(s, "denoiser", None) is not None),
+            (f"gate {cfg.gate_attenuation_db:g} dB", getattr(s, "gate", None) is not None),
+            ("AGC", getattr(s, "agc", None) is not None),
+            ("limiter", getattr(s, "limiter", None) is not None)) if on)
+        rows = [("processed", chain or "nothing is switched on"),
+                ("raw", f"the mic as it is, delayed the same {delay:.0f} ms so the switch doesn't jump")]
+        text = Text("Listen mode: no speaker identification (--mode full for that)\n\n", style="dim")
+        for state, what in rows:
+            active = (state == "processed") == pipe.processing
+            text.append(f"{'▶' if active else ' '} {state.upper():10}", style="reverse bold" if active else "")
+            text.append(f"  {what}\n", style="" if active else "dim")
+        text.append(f"\nspace switches, with a {cfg.ramp_ms:g} ms crossfade", style="dim")
+        return text
+
     def render_speakers(self, snap: TrackerSnapshot | None) -> Table | Text:
+        if getattr(self.session.pipeline, "ab", False):
+            return self.render_ab()
         if snap is None:
+            if self.listen:
+                return Text("Listen mode: no speaker identification (--mode full for that).", style="dim")
             return Text("Speaker detection is off (--no-speakers).", style="dim")
         table = Table(box=None, expand=True, pad_edge=False, show_edge=False)
         for col, kw in (("key", {"width": 4}), ("speaker", {"ratio": 2}), ("level", {"ratio": 3}),
@@ -325,10 +374,9 @@ class FocusEarApp(App):
             lines.append(f"worker ms/block mean/max (budget {m.block_ms:.0f}): {stages or '-'}   RTF {m.rtf:.3f}")
             e2e = f"{m.e2e_ms:.0f}" if m.e2e_ms is not None else "?"
             lines.append(
-                f"latency {e2e} ms ≈ mic {m.in_device_ms:.0f} + queue {m.in_queue_ms:.0f} + proc {m.proc_ms:.1f}"
-                f" + lookahead {m.delay_ms:.0f} + out-buf {m.out_buffer_ms:.0f} + out-dev {m.out_device_ms:.0f}"
+                f"latency {e2e} ms ≈ {latency_breakdown(m)}"
                 f"   glitches/s: underrun {m.out_underruns} underflow {m.out_underflows}"
-                f" overflow {m.in_overflows} worker-drop {m.worker_drop_events}")
+                f" overflow {m.in_overflows} worker-drop {m.worker_drop_events} late-undenoised {m.denoise_skips}")
             ctx = s.pipeline.ctx
             vad_now = ctx.vad_prob if ctx is not None else 0.0
             gain = f"   speaker gain {s.speaker_gain.gain_db:.0f} dB" if s.speaker_gain is not None else ""

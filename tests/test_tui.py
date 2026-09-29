@@ -140,6 +140,34 @@ class TuiTest(unittest.IsolatedAsyncioTestCase):
             await pilot.press("t")
             self.assertFalse(app.query_one("#transcript").display)
 
+    async def test_listen_mode_space_switches_processed_and_raw(self):
+        session, _ = fake_session()
+        session.cfg = Config.for_mode("listen")
+        session.tracker = session.analyzer = None
+        pipe = session.pipeline
+        pipe.ab, pipe.processing = True, True
+        pipe.set_processing = lambda on: setattr(pipe, "processing", on)
+        app = FocusEarApp(session)
+        async with app.run_test() as pilot:
+            self.assertIn("PROCESSED", str(app.query_one("#header").render()))
+            await pilot.press("space")
+            self.assertFalse(pipe.processing)
+            await pilot.pause(0.2)
+            self.assertIn("RAW", str(app.query_one("#header").render()))
+            self.assertIn("▶ RAW", str(app.query_one("#speakers").render()))
+            await pilot.press("1", "n")  # no speakers to pick or name in listen mode
+            self.assertFalse(app.query_one("#name").display)
+            await pilot.press("space")
+            self.assertTrue(pipe.processing)
+
+    async def test_full_mode_has_no_ab_switch(self):
+        session, _ = fake_session()
+        session.pipeline.processing = True
+        session.pipeline.set_processing = lambda on: self.fail("A/B in full mode")
+        app = FocusEarApp(session)
+        async with app.run_test() as pilot:
+            await pilot.press("space")
+
     async def test_fatal_audio_error_exits_with_code_2(self):
         session, _ = fake_session()
         app = FocusEarApp(session)

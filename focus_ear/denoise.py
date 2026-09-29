@@ -25,6 +25,8 @@ import sys
 import threading
 import time
 import types
+from collections import deque
+from dataclasses import dataclass, field
 
 import numpy as np
 
@@ -211,8 +213,16 @@ class DeepFilterStream:
         return out.astype(np.complex64)
 
     # Streaming -----------------------------------------------------------
-    def process(self, x: np.ndarray) -> np.ndarray:
-        """Push 48 kHz samples; returns the enhanced samples completed so far (multiples of the hop)."""
+    def process(self, x: np.ndarray, bypass: bool | None = None) -> np.ndarray:
+        """Push 48 kHz samples; returns the enhanced samples completed so far (multiples of the hop).
+
+        ``bypass=True`` passes just these samples through unenhanced, for a
+        fraction of the cost: the STFT and every delay keep running, so the
+        output stays in step, and synthesis overlap-adds the switch in and
+        out over one hop instead of clicking. The model's own state doesn't
+        advance over the skipped frames.
+        """
+        bypass = self.bypass if bypass is None else bypass
         buf = np.concatenate((self._pending, x.astype(np.float32, copy=False)))
         n = len(buf) // self.hop
         self._pending = buf[n * self.hop:]
@@ -228,7 +238,7 @@ class DeepFilterStream:
         out = np.zeros((n, spec.shape[1]), np.complex64)                        # warm-up frames stay silent
         if k:
             spec_t = hist[skip:]                                                 # frames t-2 .. t+2
-            if self.bypass:
+            if bypass:
                 enhanced = spec_t[2:k + 2]
             else:
                 # Grad mode is per thread: disabling it at load time doesn't cover the worker.
@@ -241,6 +251,14 @@ class DeepFilterStream:
         return self.df.synthesis(out[None], reset=False)[0].astype(np.float32, copy=False)
 
 
+@dataclass
+class _Job:
+    block: np.ndarray
+    done: threading.Event = field(default_factory=threading.Event)
+    out: np.ndarray | None = None
+    abandoned: bool = False     # the worker gave up waiting and played it undenoised
+
+
 class Denoiser:
     """DeepFilterStream at the stream rate: resample to 48 kHz and back, fixed delay, same-size blocks.
 
@@ -249,15 +267,27 @@ class Denoiser:
     FIFO primed with silence absorbs the jitter; its size is worked out once
     from the actual block size, and the total delay measured, in __init__.
 
-    The model runs with one torch thread on whichever thread calls process():
-    2.7 ms per 32 ms block on an M3, against 5.8 ms with torch's default of 4
-    (the frames are too small to split). The setting is per thread (OpenMP),
-    so nothing else is affected.
+    The model runs with one torch thread: 2.7 ms per 32 ms block on an M3
+    back to back, against 5.8 ms with torch's default of 4 (the frames are
+    too small to split). Live, at one block every 32 ms, it's 6-9 ms, and
+    about once a minute a single block took 70-77 ms (measured; the cause is
+    outside the model). The setting is per thread (OpenMP), so nothing else
+    is affected.
+
+    ``threaded=True`` (live) runs the model on a thread of its own, and
+    process() takes a ``deadline``: if the block isn't denoised by then, the
+    caller gets the raw block, delayed by exactly ``delay_samples`` so it
+    stays in step, instead of the output running dry. The model still sees
+    every block in order (the abandoned ones through the cheap STFT-only
+    path, which also lets it catch up), so its delay never shifts. Such
+    blocks are counted in ``late_blocks``.
     """
 
     name = "denoise"
+    WARMUP_BLOCKS = 10
 
-    def __init__(self, rate: int, blocksize: int, model, params, mix: float = 1.0, bypass: bool = False):
+    def __init__(self, rate: int, blocksize: int, model, params, mix: float = 1.0, bypass: bool = False,
+                 threaded: bool = False):
         self.rate = rate
         self.blocksize = blocksize
         self._make = lambda byp: _Chain(rate, DeepFilterStream(model, params, mix, bypass=byp))
@@ -269,7 +299,21 @@ class Denoiser:
         self._threads_set: set[int] = set()
         self.underflows = 0
         self.last_ms = 0.0
+        self.late_blocks = 0    # played undenoised because the model missed the deadline; only increases
+        self.errors = 0         # blocks the model failed on (threaded), played undenoised
         self.warmup_ms = self._time_model(model, params, mix)
+
+        self._thread: threading.Thread | None = None
+        if threaded:
+            from .gain import DelayLine
+            self._raw = DelayLine(self.delay_samples)
+            self._jobs: deque[_Job] = deque()
+            self._cv = threading.Condition()   # worker <-> model thread; never taken by an audio callback
+            self._closing = False
+            ready = threading.Event()
+            self._thread = threading.Thread(target=self._serve, args=(ready,), name="denoise", daemon=True)
+            self._thread.start()
+            ready.wait()
 
     @property
     def lsnr(self) -> float:
@@ -323,14 +367,69 @@ class Denoiser:
             torch.set_num_threads(threads)
         return 1e3 * float(np.median(times[5:]))
 
-    def process(self, block: np.ndarray, ctx=None) -> np.ndarray:
+    def process(self, block: np.ndarray, ctx=None, deadline: float | None = None) -> np.ndarray:
+        """The denoised block, ``delay_samples`` late.
+
+        Threaded: waits at most ``deadline`` seconds (None: as long as it
+        takes), then settles for the raw block, equally late.
+        """
+        if self._thread is None:
+            return self._process_now(block)
+        fallback = self._raw.process(block)  # every block, so it's in step whenever it's needed
+        job = _Job(block.copy())
+        with self._cv:
+            self._jobs.append(job)
+            self._cv.notify()
+        if job.done.wait(deadline):
+            return job.out if job.out is not None else fallback  # None: the model failed (logged)
+        job.abandoned = True
+        self.late_blocks += 1
+        return fallback
+
+    def close(self) -> None:
+        if self._thread is not None:
+            with self._cv:
+                self._closing = True
+                self._cv.notify()
+            self._thread.join(timeout=2)
+            self._thread = None
+
+    def _serve(self, ready: threading.Event) -> None:
+        # Warm torch up on this thread (thread count, first-call costs) before the first real block.
+        try:
+            warm = self._make(False)
+            for _ in range(self.WARMUP_BLOCKS):
+                self._process_now(np.zeros(self.blocksize, np.float32), chain=warm)
+        finally:
+            ready.set()
+        while True:
+            with self._cv:
+                while not self._jobs and not self._closing:
+                    self._cv.wait()
+                if not self._jobs:
+                    return
+                job = self._jobs.popleft()
+            try:
+                # Given up on already: keep the stream in step at the STFT-only cost, and catch up.
+                job.out = self._process_now(job.block, bypass=job.abandoned)
+            except Exception:  # noqa: BLE001 - the worker falls back to the raw block
+                self.errors += 1
+                if self.errors == 1:
+                    log.exception("denoising failed; playing undenoised while it keeps failing")
+            job.done.set()
+
+    def _process_now(self, block: np.ndarray, bypass: bool = False, chain: _Chain | None = None) -> np.ndarray:
+        """``bypass=True`` skips the model for this block only (see DeepFilterStream.process)."""
         tid = threading.get_ident()
         if tid not in self._threads_set:
             import torch
             torch.set_num_threads(1)
             self._threads_set.add(tid)
+        if chain is not None:  # warm-up: a throwaway chain, no FIFO
+            chain.process(block)
+            return block
         t = time.perf_counter()
-        fifo = np.concatenate((self._fifo, self.chain.process(block)))
+        fifo = np.concatenate((self._fifo, self.chain.process(block, bypass or None)))
         n = len(block)
         if len(fifo) < n:  # never happens with the computed prefill; kept as a safety net
             self.underflows += 1
@@ -401,10 +500,10 @@ class _Chain:
             self.up = PolyphaseResampler(rate, DF_RATE)
             self.down = PolyphaseResampler(DF_RATE, rate)
 
-    def process(self, x: np.ndarray) -> np.ndarray:
+    def process(self, x: np.ndarray, bypass: bool | None = None) -> np.ndarray:
         if self.up is not None:
             x = self.up.process(x)
-        y = self.dfn.process(x)
+        y = self.dfn.process(x, bypass)
         if self.down is not None:
             y = self.down.process(y)
         return y

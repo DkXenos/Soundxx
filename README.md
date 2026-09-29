@@ -1,10 +1,22 @@
 # Soundxx: focus-ear
 
-Real-time voice isolation for a noisy lecture hall. focus-ear listens through
-the MacBook's built-in mic, tells the people in the room apart, and plays the
-room to your Galaxy Buds with the speaker you pick at full volume and
-everyone else turned down. It also transcribes that speaker to a Markdown
-file as the lecture goes.
+Real-time hearing help for a noisy lecture hall. focus-ear listens through
+the MacBook's built-in mic and plays the room to your Galaxy Buds. It runs in
+one of two modes:
+
+- **`--mode listen`** (the default). The lowest-latency chain, for wearing
+  in class:
+  - high-pass, noise suppression, a gentle gate, levelling and a limiter
+  - no speaker identification
+  - about 136 ms from mic to output before Bluetooth (measured)
+  - `space` switches between processed and raw, so you can judge by ear
+- **`--mode full`**. Everything else: it tells the people in the room
+  apart, plays the one you pick at full volume, and turns everyone else
+  down. The cost is a 250 ms lookahead, about 436 ms in total.
+
+Both modes transcribe to a Markdown file as the lecture goes. Both also
+**record the raw mic**, so any lecture can be replayed through `--file` as
+often as you like while tuning.
 
 **Status:** five stages are built, plus audio conditioning and the
 hardening needed for 90-minute lectures.
@@ -62,14 +74,47 @@ and tells you. To fix it: System Settings → Privacy & Security → Microphone
 ## Using it
 
 ```sh
-python -m focus_ear                  # interactive UI
-python -m focus_ear --debug          # same, with the debug panel open
+python -m focus_ear                  # listen mode, interactive UI
+python -m focus_ear --mode full      # speakers: pick one, the rest turned down
+python -m focus_ear --debug          # either, with the debug panel open
 python -m focus_ear --list-devices   # check the mic and the Buds ("Mewo") are found
-python -m focus_ear --file lecture.wav   # transcribe a recording instead (no devices, no UI)
+python -m focus_ear --file ~/.focus-ear/sessions/2026-09-29_0914.wav   # replay a recording (no devices, no UI)
 ```
 
+### Listen mode
+
 ```
-MacBook Pro Microphone → ● Mewo   latency 612 ms (incl. 250 ms lookahead)   drops: audio 0 · embeddings 0
+MacBook Pro Microphone → ● Mewo   drops: audio 0 · late blocks undenoised 0 · transcripts 0   ● rec 12:04
+latency 136 ms = mic 34 + queue 0 + proc 9 + denoise 38 + limiter 2 + out-buf 32 + out-dev 33
+mic  -40 dB   SPEECH    gate open   PROCESSED   denoise playback · agc +4 dB
+
+Listen mode: no speaker identification (--mode full for that)
+
+▶ PROCESSED   high-pass 80 Hz → denoise → gate -12 dB → AGC → limiter
+  RAW         the mic as it is, delayed the same 40 ms so the switch doesn't jump
+
+space switches, with a 50 ms crossfade
+ space A/B: processed ↔ raw   t Transcript   d Debug   q Quit
+```
+
+- **`space`** switches between the processed chain and the raw mic. The
+  raw side is delayed by exactly the processing's delay, so the switch is
+  a 50 ms crossfade, with no click and no jump in time. Everything keeps
+  running on the side you aren't hearing, so switching back is instant.
+  - Mind the loudness when you compare. The AGC can lift quiet speech by
+    up to 24 dB, and the raw mic gets none of that, so "processed" may win
+    just by being louder.
+- **The second line is the measured latency, by stage.** It's also logged
+  a few seconds after audio starts playing, and again after every
+  reconnect. See Latency below.
+- **Speech is transcribed unlabelled**, as with `--no-speakers`.
+  `--no-transcribe` skips loading Whisper.
+
+### Full mode
+
+```
+MacBook Pro Microphone → ● Mewo   drops: audio 0 · late blocks undenoised 0 · embeddings 0   ● rec 4:12
+latency 436 ms = mic 34 + queue 0 + proc 8 + denoise 38 + speaker lookahead 250 + limiter 2 + out-buf 73 + out-dev 33
 mic  -40 dB   SPEECH    gate open   focus: Speaker 1, others -20 dB
 
 key  speaker                   level                        spoken
@@ -98,21 +143,52 @@ Transcript → 2026-09-26_0914.md   ● listening   ⋯ transcribing
    (it keeps being transcribed and saved either way). `q` quits, after
    transcribing what was still being said.
 
-`--no-tui` gives a one-line status instead of the interactive UI; you can't
-select a speaker there, but a named speaker is still auto-selected.
-`--no-speakers` skips stages 3–4 entirely (no model, no added latency).
-`--passthrough` processes nothing but still shows speech and speakers.
+`--no-tui` gives a one-line status instead of the interactive UI. You
+can't select a speaker or switch A/B there, but a named speaker is still
+auto-selected.
+In full mode, `--no-speakers` skips stages 3–4 entirely (no model, no
+added latency). `--passthrough` processes nothing but still shows speech
+and speakers.
 `--no-transcribe` skips stage 5 (no Whisper model), `--no-save` transcribes
 without writing files. `--denoise off`, `--no-agc` and `--no-limiter` switch
 off the conditioning, and `--passthrough` skips every stage of audio
 processing.
 
+### The recording
+
+Every live run, in either mode, saves the raw mic to
+`~/.focus-ear/sessions/`, named for when it started
+(`2026-09-26_0914.wav`).
+
+- It's exactly what the mic delivered, before the high-pass or anything
+  else, as 16 kHz mono 16-bit.
+- It's for analysis, not listening: about 115 MB an hour, 170 MB for a
+  90-minute lecture.
+- A thread of its own writes it about once a second. Each write updates
+  the WAV header and is synced to disk, so a crash leaves a valid file that
+  ends a second or two early. (Killed with `kill -9` after 25 s: a valid
+  22.8 s file, since the models load for the first couple of seconds.)
+- If the disk stalls for more than 30 s, the oldest audio is dropped and
+  logged. The audio path never waits for the disk.
+- `--no-record` turns it off.
+
+Replay it with `--file`, as many times as you like, with any settings:
+
+```sh
+python -m focus_ear --file ~/.focus-ear/sessions/2026-09-26_0914.wav
+python -m focus_ear --file ~/.focus-ear/sessions/2026-09-26_0914.wav --cluster-threshold 0.5
+```
+
+`--file` defaults to full mode, speakers included, whichever mode the
+lecture was recorded in.
+
 ### The transcript
 
-Each session writes two files to `~/.focus-ear/sessions/`, named for when
-it started (`2026-09-26_0914.md`, `.jsonl`). Every utterance is appended and
-flushed to disk as soon as it's transcribed, so a crash loses at most the
-sentence in progress.
+Each session also writes two transcript files, with the same name as the
+recording (`2026-09-26_0914.md`, `.jsonl`). The timestamps in them are
+positions in the recording. Every utterance is appended and flushed to
+disk as soon as it's transcribed, so a crash loses at most the sentence in
+progress.
 
 ```markdown
 # Lecture transcript: 2026-09-26 09:14
@@ -120,6 +196,7 @@ sentence in progress.
 - **Date:** Saturday 26 September 2026, 09:14
 - **Speakers:** Prof. Lee
 - **Source:** live, MacBook Pro Microphone
+- **Recording:** 2026-09-26_0914.wav (the raw mic; the timestamps below are positions in it)
 - **Model:** mlx-community/whisper-small-mlx (MLX, GPU), language id
 
 **[00:03:58] Prof. Lee:** Oke, jadi hari ini kita pakai loop untuk iterate array.
@@ -141,46 +218,108 @@ has one record per utterance, for evaluation:
 | `audio_s`, `queue_s`, `processing_s` | audio length, time waiting for Whisper, time in Whisper |
 | `model` | the model and backend |
 
-**Who gets transcribed.** The selected speaker only. While nobody is
-selected (`0`, "Everyone"), everyone is, labelled by speaker. With
-`--no-speakers`, all speech is, unlabelled.
+**Who gets transcribed:**
 
-**Offline evaluation.** `--file recording.wav` runs the same chain (VAD,
-speaker identification, utterances, Whisper) over a recording and writes the
-same two files, named `<date>_<time>_<file name>`. Any format libsndfile
-reads works (WAV, FLAC, AIFF…); stereo is mixed down. It runs as fast as
-the Mac allows (a 35 s test clip took 7 s once the models had loaded), never drops
-an utterance, and embeds every voiceprint inline so repeated runs give the
-same result. Saved speakers are recognised and auto-selected, exactly as live.
+| Situation | Transcribed |
+|---|---|
+| Full mode, a speaker selected | That speaker only |
+| Full mode, nobody selected (`0`, "Everyone") | Everyone, labelled by speaker |
+| Listen mode, or `--no-speakers` | All speech, unlabelled |
+
+**Offline evaluation.** `--file recording.wav` runs the same chain as live
+(VAD, speaker identification, utterances, Whisper) over a recording.
+
+- It writes the same two transcript files, named
+  `<date>_<time>_<file name>`.
+- Any format libsndfile reads works (WAV, FLAC, AIFF…); stereo is mixed
+  down.
+- It runs as fast as the Mac allows: a 35 s test clip took 7 s once the
+  models had loaded.
+- It never drops an utterance.
+- It embeds every voiceprint inline, so repeated runs give the same
+  speakers.
+  - Whisper's text can still differ between runs: when greedy decoding
+    fails its checks, Whisper retries at higher temperatures, which sample
+    randomly. Compare settings over several runs.
+- Saved speakers are recognised and auto-selected, exactly as live.
 
 ## What to expect
 
 ### Latency
 
-The total is roughly 650 ms in your ears:
+Measured on an M3, mic to macOS's output, with a virtual output device
+standing in for the Buds:
 
-- about 100 ms from the mic to macOS's output
-- 41 ms of noise suppression
-- the 250 ms `--lookahead`
-- the limiter's 2 ms
-- Bluetooth, about 250 ms for the Buds
+| | listen (default) | full |
+|---|---|---|
+| **total, mean** | **136 ms** (123–167) | **436 ms** (421–456) |
+| mic (a 32 ms block, plus the device) | 34 | 34 |
+| processing | 9 | 8 |
+| noise suppression | 38 | 38 |
+| speaker lookahead | — | 250 |
+| limiter | 2 | 2 |
+| output buffer | ~32 | ~73 |
+| output device | 33 | 33 |
 
-You'll hear the lecturer directly and again through the Buds; if the Buds
-have ANC, turn it on.
+The Buds add Bluetooth's own delay on top of this, which hasn't been
+measured yet. CoreAudio reports part of it as "output device", but usually
+less than the real figure. If the Buds have ANC, turn it on: you'll hear
+the lecturer directly and again through the Buds.
 
-At startup the log shows a latency estimate. It's built from the latencies
-the devices report, which for Bluetooth may be less than the real delay, so
-compare it with the measured `latency` in the header. If denoising is what
-pushes the estimate past `--latency-budget` (500 ms), you get a warning
-suggesting `--denoise off`. If the estimate is over budget even without
-denoising, an info line says so instead, with denoising's share;
-`--lookahead` is the bigger lever then.
+**Where it's reported:**
+
+- **At startup:** the log shows an estimate built from the latencies the
+  devices report.
+- **A few seconds into playback:** the measured figure, broken down as
+  above, is logged. This repeats after every reconnect. The same breakdown
+  is always on the UI's second line, and in `--no-tui`'s status line.
+
+**The output buffer (`--buffer-ms`) is the one knob here.**
+
+- The worker hands the output 32 ms blocks, so the buffer has to cover a
+  whole block plus the worker's jitter.
+- Measured over 90 s each:
+
+| `--buffer-ms` | Underruns | Mean latency |
+|---|---|---|
+| 32 | 8 | 119 ms |
+| 40 | 0 | 140 ms |
+| 48 | 1 | 155 ms |
+
+- Hence 40 ms in listen mode. Full mode keeps its 64 ms.
+- Bluetooth pulls audio in bigger, burstier chunks than the virtual device
+  did, so if you hear dropouts, raise it (`--buffer-ms 60`).
+
+**Late blocks play undenoised instead of dropping out.**
+
+- The denoiser typically takes 6–9 ms per 32 ms block. About once a minute
+  a single block took 70–77 ms, too long for the buffer.
+- So the model runs on a thread of its own, and the worker waits for it
+  only as long as the audio already queued for the output lasts.
+- A block that misses that deadline plays undenoised, still in step. It's
+  counted in the header as "late blocks undenoised", and in the health
+  line.
+- The model still sees every block in order, so its delay never shifts.
+- Over 5 minutes of listen mode:
+  - 24 blocks were undenoised, 17 of them in the first second while
+    everything warmed up.
+  - There was 1 underrun, also in that first second.
+
+`--latency-budget` (500 ms) is only a startup check. If denoising is what
+pushes the estimate past it, you get a warning suggesting `--denoise off`.
+In full mode, `--lookahead` is the bigger lever.
 
 ### Noise suppression: does it help the models, or just your ears?
 
-DeepFilterNet3 runs on the CPU, streamed 10 ms at a time. That takes
-2.7–2.9 ms per 32 ms block with one torch thread, against 5.8 ms with
-torch's default four, because the frames are too small to split.
+DeepFilterNet3 runs on the CPU, streamed 10 ms at a time, with one torch
+thread (torch's default of four is slower: the frames are too small to
+split).
+
+- Back to back it takes 2.7–2.9 ms per 32 ms block, which is what the
+  startup log reports.
+- Live, with a block every 32 ms, it takes 6–9 ms: the CPU clocks down
+  between blocks.
+
 `--denoise-scope` decides who gets the denoised audio:
 
 | scope | VAD, embeddings, Whisper | your ears |
@@ -240,7 +379,10 @@ suppression sounds processed.
 
 ### Long sessions
 
-**Memory.** A 45-minute soak pushed noisy lecture audio through the whole
+**Memory.** Listen mode loads no speaker model, so it sits at about
+1.2 GB (5 minutes measured), against 2.3 GB for full mode at idle.
+
+A 45-minute soak pushed noisy lecture audio through the whole full-mode
 chain: denoise, VAD, embeddings, Whisper, gate, gains, AGC and limiter.
 
 - Total memory settled at about 3.1 GB from minute 15 onwards, and stayed
@@ -374,8 +516,11 @@ tune with `d` open:
 
 ## Options
 
+Where a default reads "listen / full", it depends on `--mode`.
+
 | Flag | Default | Meaning |
 |---|---|---|
+| `--mode listen\|full` | `listen` (`full` with `--file`) | Lowest-latency listening, or speaker identification with per-speaker gain |
 | `--list-devices` | | Print devices and which ones would be used |
 | `--input-device NAME\|INDEX` | built-in mic | Mic to record from |
 | `--output-device NAME\|INDEX` | `Mewo` | Output, by case-insensitive name substring |
@@ -383,10 +528,10 @@ tune with `d` open:
 | `--no-tui` | | One-line status instead of the UI |
 | `--vad-threshold P` | `0.5` | Speech probability that counts as speech |
 | `--no-gate` | | Don't attenuate non-speech |
-| `--gate-attenuation DB` | `-18` | Gain when nobody is speaking |
+| `--gate-attenuation DB` | `-12` / `-18` | Gain when nobody is speaking; gentler in listen mode, where it closes between every sentence |
 | `--gate-hangover-ms MS` | `200` | Keep the gate open this long after speech |
 | `--gate-lookahead-ms MS` | `0` | Open the gate before a word starts (adds latency) |
-| `--no-speakers` | | Skip speaker identification (stages 3–4) |
+| `--no-speakers` | | Full mode without speaker identification (stages 3–4); listen mode never has it |
 | `--device auto\|mps\|cpu` | `auto` | Where the speaker model runs; `auto` is the Apple GPU when available |
 | `--cluster-threshold COS` | `0.45` | Similarity needed to count as a known speaker |
 | `--merge-threshold COS` | `0.55` | Merge speakers whose voiceprints converge this far |
@@ -397,7 +542,7 @@ tune with `d` open:
 | `--min-sightings N` | `3` | Voiceprints before a speaker is shown |
 | `--boost DB` | `0` | Gain for the selected speaker |
 | `--attenuation DB` | `-20` | Gain for everyone else |
-| `--lookahead MS` | `250` | Audio delay that aligns speaker decisions (see the table above) |
+| `--lookahead MS` | `0` / `250` | Audio delay that aligns speaker decisions (see the table above) |
 | `--highpass HZ` | `80` | High-pass against rumble and handling noise; `0` = off |
 | `--denoise on\|off` | `on` | DeepFilterNet3 noise suppression |
 | `--denoise-mix 0-1` | `1.0` | Blend of denoised and original |
@@ -413,9 +558,10 @@ tune with `d` open:
 | `--initial-prompt TEXT` | a code-mixed lecture sentence | Context for Whisper; `''` for none |
 | `--utterance-gap MS` | `800` | Silence that ends an utterance |
 | `--max-utterance SEC` | `20` | Longest utterance before it's cut |
-| `--no-save` | | Don't write `~/.focus-ear/sessions/` files |
+| `--no-save` | | Don't write the transcript files |
+| `--no-record` | | Don't save the raw mic (`~/.focus-ear/sessions/<session>.wav`) |
 | `--file PATH` | | Transcribe a recording instead of the mic |
-| `--buffer-ms MS` | `64` | Output jitter buffer; raise it if you hear dropouts |
+| `--buffer-ms MS` | `40` / `64` | Output jitter buffer; raise it if you hear dropouts |
 | `--latency low\|high\|SEC` | `low` | PortAudio device buffer hint |
 | `--allow-speakers` | | Permit loudspeaker output (refused by default: feedback) |
 | `--debug` | | Debug panel on; per-second timing, per-utterance language/logprob/speed, and a health line every 30 s in `~/.focus-ear/focus-ear.log` |
@@ -427,7 +573,12 @@ tune with `d` open:
   them. Close Zoom/Discord/dictation, or set the Mac's input to the built-in
   mic.
 - **Dropouts.** In the debug panel (`d`), check `underrun` and the worker
-  timings. Try `--buffer-ms 120`.
+  timings. Raise `--buffer-ms` 10–20 ms at a time: each step adds that much
+  latency.
+- **"late blocks undenoised" climbing** (more than a few a minute). The
+  denoiser is missing its deadline, and noise gets through in 32 ms
+  flashes. Usually the Mac is busy. A bigger `--buffer-ms` gives the model
+  more time.
 - **`embeddings … dropped` climbing.** The model can't keep up (the Mac is
   busy or throttling). Audio isn't affected; identification just gets
   coarser. `--embed-hop 0.5` halves the load.
@@ -462,14 +613,18 @@ The full sample-rate flow is documented at the top of `pipeline.py`.
 
 ```
                         ┌──────────── worker thread ─────────────────────────────┐
-built-in mic ─► in_ring ┤ high-pass 80 Hz → DeepFilterNet3 (48 kHz, 41 ms)         │
- (44.1 kHz)             │ analysis: resample to 16 kHz → 512-sample frames         │
- (44.1 kHz)   (callback │   → VAD (silero, ONNX) ─► speech yes/no                 │
-               copies)  │   → every 0.25 s: speech frames of the last 1.5 s ──────┼─► speaker-embed thread
+built-in mic ─► in_ring ┤ raw block ────────────────────────────────────────────────┼─► recorder thread → 16 kHz .wav
+ (44.1/48 kHz)          │ high-pass 80 Hz → DeepFilterNet3 (48 kHz, 38–41 ms) ◄──────┼── denoise thread (the model;
+              (callback │                                                         │   the worker waits until a deadline)
+               copies)  │ analysis: resample to 16 kHz → 512-sample frames         │
+                        │   → VAD (silero, ONNX) ─► speech yes/no                 │
+                        │   → every 0.25 s: speech frames of the last 1.5 s ──────┼─► speaker-embed thread   (full mode)
                         │                                                         │   ECAPA (MPS) → cluster
                         │   → utterance segmenter ─ utterance ─────────────────────┼─► asr thread (bounded queue)
                         │                                                         │   Whisper (MLX) → .md + .jsonl
-                        │ audio: gate → 250 ms delay → speaker gain → AGC → limiter ─► out_ring ─► Buds
+                        │ audio, full:   gate → 250 ms delay → speaker gain → AGC → limiter ─┐
+                        │ audio, listen: gate → AGC → limiter ⇄ A/B crossfade with the raw ──┴► out_ring ─► Buds
+                        │                                        mic, equally delayed        │
                         └─────────────────────────────────────────────────────────┘
           UI (main thread) ◄── SpeakerTracker snapshot, 10×/s (lock never taken by audio callbacks)
           supervisor thread: detects dead streams, probes for the Buds, reconnects
@@ -478,8 +633,9 @@ built-in mic ─► in_ring ┤ high-pass 80 Hz → DeepFilterNet3 (48 kHz, 41 m
 - **The audio callbacks only copy** into and out of lock-free
   single-producer/single-consumer rings. No inference, allocation, logging
   or locks.
-- **Native-rate streams.** Playback runs at the mic's own 44.1 kHz. The
-  models see a 16 kHz copy made by a streaming soxr resampler.
+- **Native-rate streams.** Playback runs at the mic's own rate: 44.1 kHz,
+  or 48 kHz when macOS has it set that way. The models see a 16 kHz copy
+  made by a streaming soxr resampler.
 - **Streaming DeepFilterNet.** The deepfilternet package only enhances whole
   recordings. `denoise.py` runs the same trained model incrementally: every
   causal convolution keeps the frames it needs, and every GRU keeps its
@@ -539,7 +695,8 @@ built-in mic ─► in_ring ┤ high-pass 80 Hz → DeepFilterNet3 (48 kHz, 41 m
 | `transcript.py` | Utterance segmenter, ASR thread and queue, Markdown/JSONL writer |
 | `asr.py` | mlx-whisper backend, faster-whisper fallback |
 | `tui.py` | Textual UI |
-| `main.py` | CLI, wiring, plain status mode, `--file` mode |
+| `recorder.py` | The raw mic to a 16 kHz WAV, on its own thread |
+| `main.py` | CLI and modes, wiring, plain status mode, `--file` mode |
 
 **Extension point** (in `pipeline.py`, not implemented): overlapping-speech
 separation, as an `AudioStage` that replaces the speaker gain.
@@ -584,7 +741,24 @@ python -m unittest discover -s tests
   Ctrl-C skips the wait but closes the files, and signals are counted, not
   raised.
 - **TUI:** keys, naming (digits and `q` type into the name box), exit codes,
-  the transcript panel and `t`, driven headless with Textual's pilot.
+  the transcript panel and `t`, and listen mode's `space` (with no speaker
+  keys), driven headless with Textual's pilot.
+- **Modes:**
+  - each mode's defaults, flags overriding them, and `--file` staying full
+  - the A/B switch: raw equal to the mic delayed like the processed path,
+    and no step in the output while crossfading
+  - raw taps seeing the mic before in-place stages
+- **Denoiser deadline:**
+  - the threaded denoiser equal to the inline one when on time
+  - a late block played raw, in step, with denoising carrying on after it
+  - the deadline following the output's queue, and none offline or while
+    nothing plays
+- **Recording:**
+  - a valid 16 kHz WAV while it's still being written, complete after
+  - never overwriting
+  - a stalled disk dropping the oldest audio
+  - shared file names with the transcript
+- **Latency breakdown:** every delay named by stage.
 - **Models:** the real ECAPA test, and a `--file` run through the real
   Whisper model checking one utterance per speech span at the right times,
   run when the models have been downloaded.

@@ -254,6 +254,7 @@ class AudioStats:
     out_ring_full: int = 0        # samples the worker couldn't queue (output gone)
     out_level_sum: int = 0        # output ring fill at each callback, for the mean
     out_level_count: int = 0
+    out_frames: int = 0           # samples the output device asked for, last callback
     out_device_latency: float = 0.0  # DAC time minus callback time, last seen
     e2e_sum: float = 0.0          # mic ADC to buds DAC, summed per callback
     e2e_count: int = 0
@@ -329,7 +330,7 @@ class AudioEngine:
         self.in_ring = RingBuffer(2 * fs)
         self.out_ring = RingBuffer(2 * fs)
         self._prefill = int(self.cfg.buffer_ms * fs / 1000)
-        self._drift_slack = 3 * self.blocksize
+        self._drift_slack = int(self.cfg.drift_slack_blocks * self.blocksize)
         log.info("streams: %d Hz, %d-sample blocks (%.1f ms)", fs, self.blocksize, 1e3 * self.blocksize / fs)
 
     def stop(self) -> None:
@@ -366,6 +367,12 @@ class AudioEngine:
 
     def skip_input(self, n: int) -> int:
         return self.in_ring.skip(n)
+
+    def output_headroom(self) -> float | None:
+        """Seconds of audio queued for the output: how long until it runs dry. None while nothing plays."""
+        if self.state != "running" or not self._out_primed:
+            return None
+        return self.out_ring.available() / self.samplerate
 
     def write_output(self, block: np.ndarray, adc_time: float) -> None:
         w = self.out_ring.write_index
@@ -515,6 +522,7 @@ class AudioEngine:
         avail = ring.available()
         st.out_level_sum += avail
         st.out_level_count += 1
+        st.out_frames = frames
 
         # Hold `prefill` samples in reserve so worker jitter doesn't cause
         # dropouts. Until that much has built up (at startup, after an underrun,

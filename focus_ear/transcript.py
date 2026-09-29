@@ -425,6 +425,22 @@ def _fmt(x: float | None) -> str:
 # --------------------------------------------------------------------------
 
 SPEAKERS_PLACEHOLDER = "- **Speakers:** (listed when the session ends)"
+SESSION_SUFFIXES = (".md", ".jsonl", ".wav")
+
+
+def session_stem(directory: Path, started: datetime, suffix: str = "") -> Path:
+    """``directory/<YYYY-MM-DD_HHMM><suffix>``, numbered _2, _3… if any of a session's files exist.
+
+    The transcript and the raw recording share it, so they pair up.
+    """
+    directory.mkdir(parents=True, exist_ok=True)
+    base = started.strftime("%Y-%m-%d_%H%M") + suffix
+    n = 1
+    while True:
+        stem = directory / (base if n == 1 else f"{base}_{n}")
+        if not any(stem.parent.joinpath(stem.name + ext).exists() for ext in SESSION_SUFFIXES):
+            return stem
+        n += 1
 
 
 class TranscriptWriter:
@@ -437,16 +453,10 @@ class TranscriptWriter:
     """
 
     def __init__(self, directory: Path, started: datetime, source: str, model: str, language: str,
-                 suffix: str = ""):
-        directory.mkdir(parents=True, exist_ok=True)
-        stem = started.strftime("%Y-%m-%d_%H%M") + suffix
-        n = 1
-        while True:
-            name = stem if n == 1 else f"{stem}_{n}"
-            self.md_path, self.jsonl_path = directory / f"{name}.md", directory / f"{name}.jsonl"
-            if not self.md_path.exists() and not self.jsonl_path.exists():
-                break
-            n += 1
+                 suffix: str = "", stem: Path | None = None, recording: Path | None = None):
+        stem = stem or session_stem(directory, started, suffix)
+        self.md_path = stem.parent / f"{stem.name}.md"
+        self.jsonl_path = stem.parent / f"{stem.name}.jsonl"
         self._md = open(self.md_path, "x", encoding="utf-8")
         self._jsonl = open(self.jsonl_path, "x", encoding="utf-8")
         self._lock = threading.Lock()  # the ASR thread writes; shutdown may close from the main thread
@@ -457,7 +467,9 @@ class TranscriptWriter:
             f"- **Date:** {started:%A %-d %B %Y, %H:%M}\n"
             f"{SPEAKERS_PLACEHOLDER}\n"
             f"- **Source:** {source}\n"
-            f"- **Model:** {model}, language {language}\n\n")
+            + (f"- **Recording:** {recording.name} (the raw mic; the timestamps below are positions in it)\n"
+               if recording is not None else "")
+            + f"- **Model:** {model}, language {language}\n\n")
         self._sync()
 
     def write(self, line: TranscriptLine) -> None:

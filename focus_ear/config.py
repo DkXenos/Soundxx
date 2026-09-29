@@ -19,8 +19,31 @@ DEFAULT_PROMPT = ("Oke, jadi di kuliah ini kita pakai Python. Kita define functi
                   "for loop, lalu return value-nya.")
 
 
+MODES = ("listen", "full")
+
+# What --mode listen changes from the defaults below (which are the full chain).
+# Listening doesn't wait for speaker decisions, so there's no lookahead to
+# align them, and no speaker model. The gate is gentler because it closes
+# between every sentence of a continuous lecture; the denoiser does the real
+# work. The output buffer is the smallest that didn't underrun: the worker
+# delivers 32 ms blocks, so it must cover a block plus the worker's jitter.
+# Measured to a virtual output over 90 s each: 32 ms underran 8 times with
+# most blocks missing the denoiser's deadline; 40 ms, none (README).
+MODE_DEFAULTS: dict[str, dict] = {
+    "listen": dict(speakers=False, lookahead_ms=0.0, gate_attenuation_db=-12.0, buffer_ms=40.0,
+                   drift_slack_blocks=1.5),
+    "full": {},
+}
+
+
 @dataclass
 class Config:
+    # "listen": the lowest-latency chain for wearing in class (no speaker
+    # identification). "full": speakers, per-speaker gain, the lot. The
+    # dataclass defaults are the full chain; the CLI's default mode is listen,
+    # which applies MODE_DEFAULTS["listen"] on top.
+    mode: str = "full"
+
     # Devices: name substring or PortAudio index. None input = built-in mic.
     input_device: str | None = None
     output_device: str = "Mewo"
@@ -37,6 +60,14 @@ class Config:
     # mic, it drops audio to catch up instead of letting latency grow.
     buffer_ms: float = 64.0
     max_backlog_ms: float = 100.0
+    # How far the output buffer may grow past buffer_ms (mic and Buds run on
+    # different clocks) before the excess is dropped, in worker blocks. The
+    # worker writes whole blocks, so the level swings by one block anyway.
+    drift_slack_blocks: float = 3.0
+    # When the worker has fallen a block behind, skip the denoiser's model for
+    # the late blocks (the audio passes through undenoised, still in step)
+    # so it catches up before the output runs dry.
+    late_bypass: bool = True
 
     # Input conditioning, before everything else
     highpass_hz: float = 80.0       # 0 = off
@@ -97,5 +128,16 @@ class Config:
     asr_queue: int = 4              # utterances waiting for Whisper before the oldest is dropped
     save: bool = True               # write ~/.focus-ear/sessions/*.md and *.jsonl
 
+    # The unprocessed mic of every live run, for replaying through --file later
+    record: bool = True             # ~/.focus-ear/sessions/<session>.wav
+    record_rate: int = ANALYSIS_RATE
+
     tui: bool = True
     debug: bool = False
+
+    @classmethod
+    def for_mode(cls, mode: str, **overrides) -> Config:
+        """The defaults for ``mode``, then ``overrides`` on top."""
+        if mode not in MODES:
+            raise ValueError(f"mode must be one of {MODES}")
+        return cls(mode=mode, **{**MODE_DEFAULTS[mode], **overrides})

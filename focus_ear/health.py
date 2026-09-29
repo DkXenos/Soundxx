@@ -74,12 +74,18 @@ def health_line(session: Session) -> str:
         f"mem {memory_mb():.0f} MB" + (f" ({gpu})" if gpu else ""),
         f"drops: worker {pipe.drop_events} in-ovf {st.in_overflows} underrun {st.out_underruns}"
         + (f" embed {s.analyzer.dropped}" if s.analyzer is not None else "")
-        + (f" asr {s.transcriber.dropped}" if s.transcriber is not None else ""),
+        + (f" asr {s.transcriber.dropped}" if s.transcriber is not None else "")
+        + f" | late blocks undenoised {getattr(pipe, 'denoise_skips', 0)}",
         f"queues: in {1e3 * engine.input_backlog() / fs:.0f} ms out {1e3 * engine.out_ring.available() / fs:.0f} ms"
         + (f" asr {s.transcriber.pending}" if s.transcriber is not None else ""),
         "clips: " + " ".join(f"{name} {m.count}" for name, m in pipe.clips.items()),
         f"reconnects {st.reconnects}",
     ]
+    rec = getattr(s, "recorder", None)
+    if rec is not None:
+        parts.append(f"recorded {format_uptime(rec.seconds)}" + (f" (lost {rec.dropped / rec.rate:.1f} s)"
+                                                                  if rec.dropped else "")
+                     + (f" STOPPED: {rec.error}" if rec.error else ""))
     if pipe.errors:
         parts.append(f"processing errors {pipe.errors} (last: {pipe.last_error})")
     return " | ".join(parts)

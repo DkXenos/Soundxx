@@ -27,6 +27,22 @@ which works like free lookahead for the gate. Under "models" the raw audio
 is delayed by the denoiser's delay so decisions still land on the audio they
 were made from; so every scope adds the same latency.
 
+  --mode listen      no speaker stages and no lookahead: high-pass, denoise,
+                     gate, AGC, limiter. Adds the A/B switch below.
+  --mode full        everything above.
+
+Around the chain:
+  raw taps   see each block exactly as the mic delivered it, before the
+             high-pass (the raw recording).
+  A/B        (listen mode) crossfades the output between the processed
+             chain and the raw mic delayed by the same amount, so switching
+             is click-free and the timing doesn't jump.
+  late bypass  the denoiser's model runs on its own thread (live), and the
+             worker waits for it only as long as the audio already queued for
+             the output lasts. A block that misses that deadline plays
+             undenoised but still in step, instead of the output running dry.
+             Counted in ``denoise_skips``.
+
 Extension points, deliberately not implemented yet:
   * Overlapping-speech separation: an AudioStage that replaces gating and
     returns only the selected speaker's separated signal.
@@ -50,7 +66,7 @@ import soxr
 
 from .config import ANALYSIS_FRAME, ANALYSIS_RATE, Config
 from .dsp import ClipMeter
-from .gain import DelayLine
+from .gain import DelayLine, SmoothGain
 
 if TYPE_CHECKING:
     from .audio_io import AudioEngine, AudioStats
@@ -166,11 +182,13 @@ class Pipeline:
     def __init__(self, engine: AudioEngine, cfg: Config, analyzers: list[FrameAnalyzer] | None = None,
                  stages: list[AudioStage] | None = None, taps: list[AudioTap] | None = None,
                  highpass: AudioStage | None = None, denoiser: AudioStage | None = None,
-                 denoise_scope: str = "all"):
+                 denoise_scope: str = "all", raw_taps: list[AudioTap] | None = None, ab: bool = False):
         """Create after engine.start(): the stream rate is only known then.
 
         ``highpass`` and ``denoiser`` condition the input before both paths
-        (see the module docstring); either may be None.
+        (see the module docstring); either may be None. ``raw_taps`` observe
+        the unprocessed mic. ``ab`` adds the processed/raw switch
+        (set_processing).
         """
         if denoise_scope not in self.SCOPES:
             raise ValueError(f"denoise_scope must be one of {self.SCOPES}")
@@ -179,6 +197,7 @@ class Pipeline:
         self.analyzers = list(analyzers or [])
         self.stages = list(stages or [])
         self.taps = list(taps or [])
+        self.raw_taps = list(raw_taps or [])
         self.highpass = highpass
         self.denoiser = denoiser
         self.denoise_scope = denoise_scope
@@ -186,9 +205,16 @@ class Pipeline:
                            if denoiser is not None and denoise_scope == "models" else None)
         self.timer = StageTimer()
         self._feed = AnalysisFeed(engine.samplerate)
-        # Total delay of the playback path: output samples were captured this much earlier.
-        self.delay_samples = (sum(getattr(stage, "delay_samples", 0) for stage in self.stages)
-                              + (denoiser.delay_samples if denoiser is not None else 0))
+        # Where the playback path's delay comes from, in samples: output samples
+        # were captured this much earlier (processing time and buffers aside).
+        self.delays = {name: n for name, n in
+                       [("denoise", denoiser.delay_samples if denoiser is not None else 0)]
+                       + [(stage.name, getattr(stage, "delay_samples", 0)) for stage in self.stages] if n}
+        self.delay_samples = sum(self.delays.values())
+        # A/B: the raw mic, delayed like the processed path, crossfaded in by the UI.
+        self.processing = True      # what the UI asked for; the crossfade follows it
+        self._ab_gain = SmoothGain(engine.samplerate, cfg.ramp_ms) if ab else None
+        self._ab_delay = DelayLine(self.delay_samples) if ab else None
         # Where full scale is checked. Only "output" is real clipping (the DAC
         # can't go past 1.0, so it gets clamped there); the rest say where it started.
         self.clips = {name: ClipMeter(name, limit) for name, limit in
@@ -222,6 +248,33 @@ class Pipeline:
         seconds = self.blocks * self.cfg.block_ms / 1000
         return not self.heard_signal and seconds > self.SILENT_MIC_WARN_S
 
+    @property
+    def ab(self) -> bool:
+        """Whether the processed/raw switch exists (listen mode)."""
+        return self._ab_gain is not None
+
+    @property
+    def denoise_skips(self) -> int:
+        """Blocks played undenoised because the model missed its deadline; only increases."""
+        return getattr(self.denoiser, "late_blocks", 0)
+
+    # The rest of the chain after the denoiser, plus scheduling slack: the
+    # denoiser gets whatever the output's queue leaves after this.
+    DEADLINE_MARGIN_S = 0.006
+    MIN_DEADLINE_S = 0.001
+
+    def _denoise_deadline(self) -> float | None:
+        """Seconds the worker can wait for the denoiser before the output runs dry; None: no limit."""
+        headroom = getattr(self.engine, "output_headroom", None)
+        seconds = headroom() if headroom is not None else None
+        if seconds is None or not self.cfg.late_bypass:
+            return None
+        return max(self.MIN_DEADLINE_S, seconds - self.DEADLINE_MARGIN_S)
+
+    def set_processing(self, on: bool) -> None:
+        """A/B: True plays the processed chain, False the raw mic; the worker crossfades over ramp_ms."""
+        self.processing = bool(on)
+
     def start(self) -> None:
         self._stop.clear()
         self._thread = threading.Thread(target=self._run, name="pipeline-worker", daemon=True)
@@ -232,8 +285,8 @@ class Pipeline:
         if self._thread is not None:
             self._thread.join()
             self._thread = None
-        for analyzer in self.analyzers:
-            close = getattr(analyzer, "close", None)  # analyzers with their own threads
+        for x in self.analyzers + self.raw_taps + self.taps + [self.denoiser]:
+            close = getattr(x, "close", None)  # those with threads or files of their own
             if close is not None:
                 close()
 
@@ -281,6 +334,9 @@ class Pipeline:
         self.in_db = _db(float(np.sqrt(np.mean(block * block))))
         self.clips["mic"].check(block)
         ctx = self._ctx = dataclasses.replace(self._ctx, index=self.blocks, adc_time=adc_time)
+        for tap in self.raw_taps:
+            tap.observe(block, ctx)
+        dry = block.copy() if self._ab_gain is not None else None  # the stages may work in place
 
         raw = block
         if self.highpass is not None:
@@ -290,7 +346,9 @@ class Pipeline:
         analysis = playback = raw
         if self.denoiser is not None:
             t = time.perf_counter()
-            denoised = self.denoiser.process(raw, ctx)
+            deadline = self._denoise_deadline()
+            denoised = (self.denoiser.process(raw, ctx) if deadline is None
+                        else self.denoiser.process(raw, ctx, deadline=deadline))
             timer.add(self.denoiser.name, time.perf_counter() - t)
             self.clips["denoise"].check(denoised)
             scope = self.denoise_scope
@@ -314,6 +372,12 @@ class Pipeline:
             t = time.perf_counter()
             out = stage.process(out, ctx)
             timer.add(stage.name, time.perf_counter() - t)
+        if self._ab_gain is not None:
+            dry = self._ab_delay.process(dry)  # always runs, so the raw side stays in step
+            self._ab_gain.set_target(1.0 if self.processing else 0.0)
+            if self._ab_gain.current != 1.0 or self._ab_gain.target != 1.0:
+                wet = self._ab_gain.process(np.ones(len(out), np.float32))  # the crossfade curve
+                out = dry + wet * (out - dry)
         if self.clips["output"].check(out):
             out = np.clip(out, -1.0, 1.0)  # what the DAC would do anyway; counted and reported
         for tap in self.taps:
@@ -339,10 +403,12 @@ class MetricsSnapshot:
     in_device_ms: float
     in_queue_ms: float
     proc_ms: float
-    delay_ms: float                 # lookahead delay lines in the stages
+    delay_ms: float                 # every delay in the playback path (denoiser, lookaheads, limiter)
     out_buffer_ms: float
     out_device_ms: float
     stages: dict[str, tuple[float, float]] = field(default_factory=dict)  # name -> (mean, max) ms
+    delays: dict[str, float] = field(default_factory=dict)  # delay_ms by stage, ms
+    denoise_skips: int = 0          # late blocks passed through undenoised this interval
     block_ms: float = 0.0
     rtf: float = 0.0                # processing time / audio time; must stay well below 1
     speech_pct: float = 0.0         # share of blocks the VAD called speech
@@ -355,6 +421,22 @@ class MetricsSnapshot:
     worker_dropped_ms: float = 0.0
     worker_drop_events: int = 0
     clips: dict[str, int] = field(default_factory=dict)  # samples at full scale this interval, per point
+
+
+DELAY_LABELS = {"speaker-gain": "speaker lookahead", "gate": "gate lookahead"}
+
+
+def latency_breakdown(snap: MetricsSnapshot) -> str:
+    """'mic 33 + queue 0 + proc 8 + denoise 38 + limiter 2 + out-buf 40 + out-dev 33': where e2e goes.
+
+    Approximate: the parts are measured separately and should roughly sum
+    to the measured end-to-end figure.
+    """
+    delays = snap.delays or ({"delays": snap.delay_ms} if snap.delay_ms else {})
+    parts = [("mic", snap.in_device_ms), ("queue", snap.in_queue_ms), ("proc", snap.proc_ms),
+             *((DELAY_LABELS.get(name, name), ms) for name, ms in delays.items()),
+             ("out-buf", snap.out_buffer_ms), ("out-dev", snap.out_device_ms)]
+    return " + ".join(f"{label} {ms:.0f}" for label, ms in parts)
 
 
 class MetricsCollector:
@@ -371,7 +453,7 @@ class MetricsCollector:
         p = self.pipeline
         return {"blocks": p.blocks, "backlog": p.backlog_sum, "speech": p.speech_blocks,
                 "prob": p.vad_prob_sum, "dropped": p.dropped, "drops": p.drop_events,
-                **{f"clip_{name}": meter.count for name, meter in p.clips.items()}}
+                "skips": p.denoise_skips, **{f"clip_{name}": meter.count for name, meter in p.clips.items()}}
 
     def snapshot(self) -> MetricsSnapshot:
         fs, bs = self.engine.samplerate, self.engine.blocksize
@@ -399,6 +481,8 @@ class MetricsCollector:
             out_buffer_ms=1e3 * (cur.out_level_sum - prev.out_level_sum) / lvl_n / fs if lvl_n else 0.0,
             out_device_ms=1e3 * cur.out_device_latency,
             stages=stages,
+            delays={name: 1e3 * n / fs for name, n in self.pipeline.delays.items()},
+            denoise_skips=int(d["skips"]),
             block_ms=block_ms,
             rtf=proc_ms / block_ms,
             speech_pct=100.0 * d["speech"] / blocks if blocks else 0.0,
