@@ -111,7 +111,7 @@ class OnlineClusterer:
     def prune(self, now: float, protected: frozenset[int] = frozenset()) -> list[int]:
         gone = []
         for s in list(self.speakers.values()):
-            if s.enrolled or s.id in protected:
+            if s.enrolled or s.name is not None or s.id in protected:
                 continue
             limit = self.timeout_s if self.confirmed(s) else self.phantom_timeout_s
             if now - s.last_seen > limit:
@@ -132,7 +132,8 @@ class OnlineClusterer:
 
     def _create(self, e: np.ndarray, now: float, protected: frozenset[int]) -> Speaker | None:
         if len(self.speakers) >= self.max_speakers:
-            victims = [s for s in self.speakers.values() if not s.enrolled and s.id not in protected]
+            victims = [s for s in self.speakers.values()
+                       if not s.enrolled and s.name is None and s.id not in protected]
             if not victims:
                 return None
             # Unconfirmed clusters go first, then whoever was heard least recently.
@@ -152,7 +153,8 @@ class OnlineClusterer:
                 continue  # two enrolled people stay distinct, however similar
             if float(other.centroid @ s.centroid) < self.merge_threshold:
                 continue
-            rank = lambda x: (x.id in protected, x.enrolled, self.confirmed(x), -x.id)  # noqa: E731
+            rank = lambda x: (x.id in protected, x.enrolled, x.name is not None, self.confirmed(x),  # noqa: E731
+                              -x.id)
             keep, drop = (s, other) if rank(s) > rank(other) else (other, s)
             cap = round(1 / self.alpha)
             wk, wd = min(keep.weight, cap), min(drop.weight, cap)
@@ -163,6 +165,8 @@ class OnlineClusterer:
             keep.first_seen = min(keep.first_seen, drop.first_seen)
             keep.last_seen = max(keep.last_seen, drop.last_seen)
             keep.level_db = max(keep.level_db, drop.level_db)
+            if keep.name is None and drop.name is not None:
+                keep.name = drop.name
             del self.speakers[drop.id]
             merged.append((drop.id, keep.id))
             s = keep
@@ -213,6 +217,9 @@ class SpeakerTracker:
         self._last: Assignment | None = None
         self._embeddings = 0
         self._events: deque[str] = deque(maxlen=20)
+        # Number keys stay with a speaker for the session: speaker id -> key.
+        # A merge or an expiry used to renumber everyone listed after it.
+        self._keys: dict[int, int] = {}
         # Embedding quality, for comparing --denoise-scope settings: how close
         # each voiceprint was to the speaker it matched, and how often one
         # matched nobody and founded a new cluster. Only increase.
@@ -230,6 +237,12 @@ class SpeakerTracker:
             c.prune(now, protected)
             self._last = a
             self._embeddings += 1
+            for gone, kept in a.merged:
+                if gone in self._keys and kept not in self._keys:
+                    self._keys[kept] = self._keys[gone]
+                self._keys.pop(gone, None)
+                if self.selected_id == gone:
+                    self.selected_id = kept
             if a.created:
                 self.clusters_founded += 1
             elif a.similarities:
@@ -269,17 +282,33 @@ class SpeakerTracker:
         return self.boost_gain if speaker_id == selected else self.attenuation_gain
 
     # UI side -------------------------------------------------------------
+    def _shown(self) -> list[Speaker]:
+        """Confirmed speakers in key order; gives newly confirmed ones the lowest free key. Lock held."""
+        c = self.clusterer
+        shown = [s for s in c.speakers.values() if c.confirmed(s)]
+        alive = {s.id for s in shown}
+        for sid in [k for k in self._keys if k not in c.speakers]:
+            del self._keys[sid]  # forgotten (merged ones were handed over in observe)
+        used = {k for sid, k in self._keys.items() if sid in alive}
+        for s in shown:
+            if s.id not in self._keys:
+                key = next(k for k in range(1, len(self._keys) + len(shown) + 2) if k not in used)
+                self._keys[s.id] = key
+                used.add(key)
+        return sorted(shown, key=lambda s: self._keys[s.id])
+
     def snapshot(self, now: float | None = None) -> TrackerSnapshot:
         now = time.monotonic() if now is None else now
         with self._lock:
             c = self.clusterer
-            shown = [s for s in c.speakers.values() if c.confirmed(s)]
+            shown = self._shown()
             talking_id = (self._active_id if self._speech_now and now - self._active_time < self.ACTIVE_S
                           else None)
             views = tuple(
-                SpeakerView(key=i, id=s.id, label=s.label, level_db=s.level_db, speaking_s=s.speaking_s,
-                            talking=s.id == talking_id, selected=s.id == self.selected_id, enrolled=s.enrolled)
-                for i, s in enumerate(shown, start=1))
+                SpeakerView(key=self._keys[s.id], id=s.id, label=s.label, level_db=s.level_db,
+                            speaking_s=s.speaking_s, talking=s.id == talking_id, selected=s.id == self.selected_id,
+                            enrolled=s.enrolled)
+                for s in shown)
             sims: tuple[tuple[str, float], ...] = ()
             assigned = None
             if self._last is not None:
@@ -309,40 +338,76 @@ class SpeakerTracker:
             return events
 
     def select(self, key: int) -> str:
-        """Select by number key: 0 = passthrough, n = the n-th shown speaker."""
+        """Select by number key: 0 = passthrough, n = the speaker showing key n (keys don't shift)."""
         with self._lock:
-            self._user_chose = True
             if key == 0:
+                self._user_chose = True
                 self.selected_id = None
                 return "Passthrough: every speaker at full volume"
-            shown = [s for s in self.clusterer.speakers.values() if self.clusterer.confirmed(s)]
-            if not 1 <= key <= len(shown):
+            match = next((s for s in self._shown() if self._keys[s.id] == key), None)
+            if match is None:
                 return f"No speaker {key}"
-            self.selected_id = shown[key - 1].id
-            return f"Focusing on {shown[key - 1].label}"
+            self._user_chose = True
+            self.selected_id = match.id
+            return f"Focusing on {match.label}"
+
+    def select_id(self, speaker_id: int | None) -> str:
+        """Select by speaker id (what the app sends); None = passthrough."""
+        with self._lock:
+            if speaker_id is None:
+                self._user_chose = True
+                self.selected_id = None
+                return "Passthrough: every speaker at full volume"
+            s = self.clusterer.speakers.get(speaker_id)
+            if s is None or not self.clusterer.confirmed(s):
+                return f"Speaker {speaker_id} is no longer listed"
+            self._user_chose = True
+            self.selected_id = s.id
+            return f"Focusing on {s.label}"
+
+    def name_speaker(self, speaker_id: int, name: str, remember: bool = True
+                     ) -> list[tuple[str, np.ndarray]] | None:
+        """Name a speaker by id. ``remember`` also saves their voiceprint for next time.
+
+        Returns every enrolled profile (to save) when remembering, [] when
+        only naming for this session, None if there's no such speaker or no name.
+        """
+        name = name.strip()
+        with self._lock:
+            s = self.clusterer.speakers.get(speaker_id)
+            if s is None or not name:
+                return None
+            for other in self.clusterer.speakers.values():
+                if other is not s and other.name == name:
+                    other.name, other.enrolled = None, False  # the name moves to this voice
+            s.name = name
+            if not remember:
+                return []
+            s.enrolled = True
+            s.saved_centroid = s.centroid.copy()
+            s.weight = max(s.weight, round(1 / self.clusterer.alpha))
+            return [(x.name, x.saved_centroid.copy()) for x in self.clusterer.speakers.values() if x.enrolled]
+
+    def export(self) -> list[dict]:
+        """Every confirmed speaker with their voiceprint: for the session's speakers.npz and session.json."""
+        with self._lock:
+            return [{"id": s.id, "label": s.label, "name": s.name, "enrolled": s.enrolled,
+                     "speaking_s": round(s.speaking_s, 1), "centroid": s.centroid.copy()}
+                    for s in self._shown()]
 
     def enroll_selected(self, name: str) -> list[tuple[str, np.ndarray]] | None:
         """Name the selected speaker and mark them enrolled.
 
         Returns every enrolled profile (to save), or None if nobody is selected.
         """
-        name = name.strip()
-        with self._lock:
-            s = self.clusterer.speakers.get(self.selected_id)
-            if s is None or not name:
-                return None
-            for other in self.clusterer.speakers.values():
-                if other is not s and other.name == name:
-                    other.name, other.enrolled = None, False  # the name moves to this voice
-            s.name, s.enrolled = name, True
-            s.saved_centroid = s.centroid.copy()
-            s.weight = max(s.weight, round(1 / self.clusterer.alpha))
-            return [(x.name, x.saved_centroid.copy()) for x in self.clusterer.speakers.values() if x.enrolled]
+        selected = self.selected_id
+        return None if selected is None else self.name_speaker(selected, name, remember=True)
 
     def reset(self) -> None:
         with self._lock:
             self.clusterer.reset()
             if self.selected_id not in self.clusterer.speakers:
                 self.selected_id = None
+            self._keys = {sid: k for sid, k in self._keys.items() if sid in self.clusterer.speakers}
             self._active_id = None
             self._last = None

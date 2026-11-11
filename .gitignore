@@ -4,3 +4,6 @@ __pycache__/
 *.pyc
 .DS_Store
 nommit-c6351ca0633d.json
+Soundxx.app/
+eval/results/*/work/
+eval/cases/

@@ -96,7 +96,7 @@ class UtteranceSegmenter:
         self._confirm = max(1, round(confirm_s / FRAME_S))
         self._tail = round(self.TAIL_S / FRAME_S)
         self._preroll: deque[np.ndarray] = deque(maxlen=math.ceil(preroll_ms / 1000 / FRAME_S))
-        self._origin: float | None = None
+        self._block, self._block_frames = -1, 0
         self._last_speaker: int | None = None
         self._clear()
         # Read by the UI; only ever increase.
@@ -120,8 +120,13 @@ class UtteranceSegmenter:
         return len(self._frames) * FRAME_S
 
     def analyze(self, frame: np.ndarray, ctx: BlockContext) -> None:
-        if self._origin is None:
-            self._origin = ctx.adc_time
+        # Times are positions in the recording (ctx.media_time), not the wall
+        # clock, so a pause never shifts a line off its audio. Frames of one
+        # block share the block's time; the n-th frame since it is n frames on.
+        if self._block != ctx.index:
+            self._block, self._block_frames = ctx.index, 0
+        now = ctx.media_time + self._block_frames * FRAME_S
+        self._block_frames += 1
         speech = ctx.is_speech
         if not self._frames:
             if not speech:
@@ -130,7 +135,7 @@ class UtteranceSegmenter:
             self._frames = list(self._preroll)
             self._speech = [False] * len(self._frames)
             self._who = [None] * len(self._frames)
-            self._t0 = ctx.adc_time - self._origin - len(self._frames) * FRAME_S
+            self._t0 = now - len(self._frames) * FRAME_S
             self._preroll.clear()
 
         who = ctx.speaker_id if speech else None
@@ -164,6 +169,11 @@ class UtteranceSegmenter:
         self._preroll.extend(tail)  # trailing silence is the next utterance's pre-roll
 
     close = flush  # Pipeline.stop() closes analyzers: don't lose the last words at quit
+
+    def pause(self) -> None:
+        """Pipeline pause: close the open utterance; the audio before the pause is no pre-roll."""
+        self.flush()
+        self._preroll.clear()
 
     def reset(self) -> None:
         self._clear()

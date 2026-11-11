@@ -43,6 +43,15 @@ Around the chain:
              undenoised but still in step, instead of the output running dry.
              Counted in ``denoise_skips``.
 
+Pause (set_paused): the worker keeps reading the mic, so the level meter
+stays alive, but nothing is recorded, analysed, transcribed or played. The
+utterance being collected is closed first, so it still gets transcribed.
+``media_time`` doesn't advance while paused.
+
+Stage swaps (set_stages): the playback stages can be replaced between two
+blocks (switching between listen and focus mode mid-session). The delays
+are recomputed, so the latency accounting and the A/B delay stay right.
+
 Extension points, deliberately not implemented yet:
   * Overlapping-speech separation: an AudioStage that replaces gating and
     returns only the selected speaker's separated signal.
@@ -82,6 +91,10 @@ class BlockContext:
     index: int          # running block counter
     adc_time: float     # time.monotonic() at which block[0] hit the mic's ADC
     samplerate: int     # stream (playback) rate of the block
+    # Position of block[0] in the recording, in seconds: stops while paused,
+    # so transcript times stay positions in audio.wav. Equals the file
+    # position in --file mode.
+    media_time: float = 0.0
     # Analysis results. A block doesn't always complete a model frame, so
     # each block starts from the previous block's values.
     vad_prob: float = 0.0           # Stage 1
@@ -207,14 +220,15 @@ class Pipeline:
         self._feed = AnalysisFeed(engine.samplerate)
         # Where the playback path's delay comes from, in samples: output samples
         # were captured this much earlier (processing time and buffers aside).
-        self.delays = {name: n for name, n in
-                       [("denoise", denoiser.delay_samples if denoiser is not None else 0)]
-                       + [(stage.name, getattr(stage, "delay_samples", 0)) for stage in self.stages] if n}
-        self.delay_samples = sum(self.delays.values())
+        self._compute_delays()
         # A/B: the raw mic, delayed like the processed path, crossfaded in by the UI.
         self.processing = True      # what the UI asked for; the crossfade follows it
         self._ab_gain = SmoothGain(engine.samplerate, cfg.ramp_ms) if ab else None
         self._ab_delay = DelayLine(self.delay_samples) if ab else None
+        self.paused = False         # what the UI asked for; the worker follows on the next block
+        self._was_paused = False
+        self._media_samples = 0     # samples that went into the recording (not while paused)
+        self._new_stages: list[AudioStage] | None = None
         # Where full scale is checked. Only "output" is real clipping (the DAC
         # can't go past 1.0, so it gets clamped there); the rest say where it started.
         self.clips = {name: ClipMeter(name, limit) for name, limit in
@@ -237,6 +251,38 @@ class Pipeline:
 
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
+
+    def _compute_delays(self) -> None:
+        self.delays = {name: n for name, n in
+                       [("denoise", self.denoiser.delay_samples if self.denoiser is not None else 0)]
+                       + [(stage.name, getattr(stage, "delay_samples", 0)) for stage in self.stages] if n}
+        self.delay_samples = sum(self.delays.values())
+
+    @property
+    def media_time(self) -> float:
+        """Seconds recorded so far (pauses excluded)."""
+        return self._media_samples / self.engine.samplerate
+
+    def set_paused(self, paused: bool) -> None:
+        """Stop (True) or resume recording, analysis and playback; the mic meter keeps running."""
+        self.paused = bool(paused)
+
+    def set_stages(self, stages: list[AudioStage]) -> None:
+        """Replace the playback stages from the next block on (any thread)."""
+        self._new_stages = list(stages)
+
+    def _apply_new_stages(self) -> None:
+        stages, self._new_stages = self._new_stages, None
+        self.stages = stages
+        self._compute_delays()
+        if self._ab_delay is not None:
+            self._ab_delay = DelayLine(self.delay_samples)
+
+    def _enter_pause(self) -> None:
+        for x in self.analyzers:
+            pause = getattr(x, "pause", None)  # the segmenter closes its utterance
+            if pause is not None:
+                pause()
 
     @property
     def mic_silent(self) -> bool:
@@ -333,7 +379,19 @@ class Pipeline:
         self.heard_signal = self.heard_signal or bool(block.any())
         self.in_db = _db(float(np.sqrt(np.mean(block * block))))
         self.clips["mic"].check(block)
-        ctx = self._ctx = dataclasses.replace(self._ctx, index=self.blocks, adc_time=adc_time)
+        if self._new_stages is not None:
+            self._apply_new_stages()
+        if self.paused:
+            if not self._was_paused:
+                self._was_paused = True
+                self._enter_pause()
+            self.blocks += 1
+            self.out_db = -200.0
+            return np.zeros_like(block)
+        self._was_paused = False
+        ctx = self._ctx = dataclasses.replace(self._ctx, index=self.blocks, adc_time=adc_time,
+                                              media_time=self._media_samples / self._ctx.samplerate)
+        self._media_samples += len(block)
         for tap in self.raw_taps:
             tap.observe(block, ctx)
         dry = block.copy() if self._ab_gain is not None else None  # the stages may work in place

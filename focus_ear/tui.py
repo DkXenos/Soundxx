@@ -249,6 +249,8 @@ class FocusEarApp(App):
         engine, pipe = s.engine, s.pipeline
         if engine.state == "running":
             out = f"[green]● {escape(engine.output_name or '')}[/]"
+        elif cfg.output_device is None:
+            out = "[yellow]○ no output: recording only[/]"
         else:
             out = f"[yellow]○ waiting for {escape(repr(cfg.output_device))} (asleep or disconnected)[/]"
         if m is not None and m.e2e_ms is not None:

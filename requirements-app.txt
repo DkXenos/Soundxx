@@ -1,0 +1,24 @@
+# The app (Stage 2): local server, native window. Install after requirements.txt.
+# Pinned to what was verified on Python 3.11.16, macOS 26, Apple M3 (8 GB). Installing these upgrades nothing in requirements.txt.
+annotated-doc==0.0.6
+annotated-types==0.8.0
+bottle==0.13.4
+fastapi==0.162.4
+proxy_tools==0.1.0
+pydantic==2.14.3
+pydantic_core==2.50.4
+pyobjc-core==13.0
+pyobjc-framework-AVFoundation==13.0
+pyobjc-framework-Cocoa==13.0
+pyobjc-framework-CoreAudio==13.0
+pyobjc-framework-CoreMedia==13.0
+pyobjc-framework-Quartz==13.0
+pyobjc-framework-Security==13.0
+pyobjc-framework-UniformTypeIdentifiers==13.0
+pyobjc-framework-WebKit==13.0
+pywebview==6.2.1
+starlette==1.10.0
+typing-inspection==0.4.5
+uvicorn==0.54.0
+websockets==17.4
+opentelemetry-api==1.45.2

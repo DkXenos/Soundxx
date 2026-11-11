@@ -201,6 +201,16 @@ def check_device_pair(input_name: str, output_name: str, allow_speakers: bool) -
         )
 
 
+def lid_closed() -> bool:
+    """True if the MacBook's lid is closed (the built-in mic is then off in hardware)."""
+    try:
+        out = subprocess.run(["ioreg", "-r", "-k", "AppleClamshellState", "-d", "4"], capture_output=True,
+                             text=True, timeout=3).stdout
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return '"AppleClamshellState" = Yes' in out
+
+
 def _reinit_portaudio() -> None:
     # sounddevice has no public way to refresh the device list. Pa_Terminate()
     # followed by Pa_Initialize() is the only way to pick up hot-plugged
@@ -302,6 +312,7 @@ class AudioEngine:
         self._grace_until = 0.0
         self._next_probe = 0.0
         self._lost_at: float | None = None  # when the output went away
+        self._switch_to: tuple[str | None] | None = None  # set_output() request for the supervisor
 
     # Lifecycle -----------------------------------------------------------
     def start(self) -> None:
@@ -322,6 +333,15 @@ class AudioEngine:
                         "(pick one with --output-device)", self._out_query, outputs)
         self._supervisor = threading.Thread(target=self._supervise, name="audio-supervisor", daemon=True)
         self._supervisor.start()
+
+    def set_output(self, query: str | None) -> None:
+        """Play to another output from now on (None: no output, the mic carries on).
+
+        Any thread; the supervisor does the switch (it owns every PortAudio
+        call after start()). A device that can't be found means waiting for
+        it, as at startup.
+        """
+        self._switch_to = (query,)
 
     def _configure(self, devices: list[dict]) -> None:
         in_idx = find_device(devices, self._in_query, "input")
@@ -442,6 +462,8 @@ class AudioEngine:
     def _supervise(self) -> None:
         while not self._stop.wait(self.POLL_S):
             try:
+                if self._switch_to is not None:
+                    self._switch_output()
                 self._reap_dead_streams()
                 if self.state == "waiting" and time.monotonic() >= self._next_probe:
                     self._next_probe = time.monotonic() + self.PROBE_INTERVAL_S
@@ -451,6 +473,36 @@ class AudioEngine:
                 return
             except Exception:
                 log.exception("audio supervisor error")
+
+    def _switch_output(self) -> None:
+        (query,), self._switch_to = self._switch_to, None
+        if query is not None and self._out_stream is not None and query in (self.output_name, self._out_query):
+            return  # already playing there: reopening would only cause a gap
+        if query is not None:
+            devices = list_devices()
+            try:
+                idx = find_device(devices, query, "output")
+                check_device_pair(self.input_name or "", devices[idx]["name"], self.cfg.allow_speakers)
+            except DeviceError as exc:
+                if "loudspeakers" in str(exc):
+                    log.warning("not switching output: %s", exc)
+                    return
+                # Not in this process's (possibly stale) list: wait and probe for it.
+        log.info("switching output from %r to %r", self.output_name, query)
+        if self._out_stream is not None:
+            self._close_dead(self._out_stream)
+            self._out_stream = None
+        self._out_query = query
+        self.output_name = None
+        self._lost_at = None  # a chosen switch isn't a reconnect
+        self.state = "waiting"
+        if query is None:
+            return
+        try:
+            self._open_streams()
+        except (DeviceError, sd.PortAudioError) as exc:
+            log.info("output %r isn't available yet (%s); waiting for it", query, exc)
+            self.state = "waiting"
 
     def _reap_dead_streams(self) -> None:
         now = time.monotonic()
@@ -466,18 +518,22 @@ class AudioEngine:
             self.state = "waiting"
         if self._in_stream is not None and (
                 not self._in_stream.active or now - st.in_heartbeat > self.STALE_S):
-            log.warning("input %r stopped; waiting for it", self.input_name)
+            log.warning("input %r stopped; waiting for it%s", self.input_name,
+                        " (the lid is closed: macOS switches the built-in mic off)" if lid_closed() else "")
             self._close_dead(self._in_stream)
             self._in_stream = None
             self.state = "waiting"
 
     def _try_reconnect(self) -> None:
+        if self._out_query is None and self._in_stream is not None:
+            return  # no output wanted and the mic is fine: nothing to wait for
         devices = probe_devices()
         if devices is None:
             return
         try:
             find_device(devices, self._in_query, "input")
-            find_device(devices, self._out_query, "output")
+            if self._out_query is not None:
+                find_device(devices, self._out_query, "output")
         except DeviceError:
             return  # not back yet
 

@@ -37,7 +37,8 @@ class Feed:
 
     def run(self, n, speech=True, speaker=None):
         for _ in range(n):
-            ctx = BlockContext(index=self.i, adc_time=self.i * FRAME_S, samplerate=16000,
+            ctx = BlockContext(index=self.i, adc_time=self.i * FRAME_S, media_time=self.i * FRAME_S,
+                               samplerate=16000,
                                is_speech=speech, speaker_id=speaker)
             self.seg.analyze(np.full(512, float(self.i), np.float32), ctx)
             self.i += 1
@@ -361,7 +362,7 @@ class RealModelTest(unittest.TestCase):
             logging.getLogger("focus_ear").setLevel(logging.WARNING)
             code = main.run_file(main.Config(speakers=False, language="auto"), str(SPEECH_WAV))
             self.assertEqual(code, 0)
-            (jsonl,) = Path(tmp).glob("*_speech_16k.jsonl")
+            (jsonl,) = Path(tmp).glob("*_speech-16k/live.jsonl")  # a session folder named after the file
             records = [json.loads(x) for x in jsonl.read_text().splitlines()]
             # One utterance per speech span of the fixture, at the right times.
             self.assertEqual(len(records), len(SPEECH_SPANS))

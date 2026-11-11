@@ -25,8 +25,9 @@ from .health import format_conditioning, format_uptime, health_line
 from .pipeline import MIC_SILENT_HINT, MetricsCollector, MetricsSnapshot, Pipeline, latency_breakdown
 from .profiles import load_profiles, save_profiles
 from .recorder import RawRecorder
-from .transcript import (AsrUnavailable, Transcriber, TranscriptLine, TranscriptWriter, UtteranceSegmenter, clock,
-                         session_stem)
+from .sessions import AUDIO_FILE, LIVE_STEM, SessionStore, now_iso
+from .settings import load_settings, update_settings
+from .transcript import AsrUnavailable, Transcriber, TranscriptLine, TranscriptWriter, UtteranceSegmenter, clock
 from .vad import VadAnalyzer
 
 log = logging.getLogger("focus_ear")
@@ -76,8 +77,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--list-devices", action="store_true", help="print audio devices and exit")
     p.add_argument("--input-device", metavar="NAME|INDEX", default=d.input_device,
                    help="mic to record from (default: the built-in MacBook microphone)")
-    p.add_argument("--output-device", metavar="NAME|INDEX", default=d.output_device,
-                   help=f"where to play the result, by name substring (default: {d.output_device!r})")
+    p.add_argument("--output-device", metavar="NAME|INDEX", default=None,
+                   help="where to play the result, by name substring (default: the last one chosen, here or in "
+                        "the app; 'Mewo' the first time). 'none' records without playing anything")
     p.add_argument("--passthrough", action="store_true",
                    help="no audio processing at all (speech and speakers are still shown)")
     p.add_argument("--no-tui", dest="tui", action="store_false",
@@ -170,12 +172,12 @@ def build_parser() -> argparse.ArgumentParser:
     t.add_argument("--max-utterance", type=float, default=d.max_utterance_s, metavar="SEC",
                    help=f"longest utterance before it's cut and transcribed (default: {d.max_utterance_s:g})")
     t.add_argument("--no-save", dest="save", action="store_false",
-                   help=f"don't write the transcript to {SESSIONS_DIR}")
+                   help=f"don't write the transcript to {SESSIONS_DIR}/<session>/")
     t.add_argument("--file", metavar="WAV",
                    help="transcribe an audio file instead of the mic (no audio devices, no UI); "
                         "writes the same transcript files")
     t.add_argument("--no-record", dest="record", action="store_false",
-                   help=f"don't save the raw mic of a live run to {SESSIONS_DIR}/<session>.wav "
+                   help=f"don't save the raw mic of a live run to {SESSIONS_DIR}/<session>/audio.wav "
                         "(16 kHz mono, about 115 MB an hour)")
 
     p.add_argument("--buffer-ms", type=float, default=None, metavar="MS",
@@ -186,6 +188,8 @@ def build_parser() -> argparse.ArgumentParser:
                    help="permit loudspeaker output (the mic will pick it up and feed back)")
     p.add_argument("--debug", action="store_true",
                    help=f"show the debug panel and log timing every second to {LOG_FILE}")
+    p.add_argument("--title", default="", help="session title (names the session folder)")
+    p.add_argument("--course", default="", help="course name, for the session list")
     return p
 
 
@@ -193,11 +197,14 @@ def config_from_args(args: argparse.Namespace) -> Config:
     # Live runs default to listening; --file has no ears to serve, so it
     # defaults to the full analysis (speakers included), as before.
     mode = args.mode or ("full" if args.file else "listen")
+    output = args.output_device if args.output_device is not None else load_settings()["output_device"]
+    if isinstance(output, str) and output.strip().lower() == "none":
+        output = None
     by_mode = {key: value for key, value in (("buffer_ms", args.buffer_ms), ("lookahead_ms", args.lookahead),
                                              ("gate_attenuation_db", args.gate_attenuation)) if value is not None}
     return Config.for_mode(
         mode, **by_mode,
-        input_device=args.input_device, output_device=args.output_device, allow_speakers=args.allow_speakers,
+        input_device=args.input_device, output_device=output, allow_speakers=args.allow_speakers,
         latency=args.latency, passthrough=args.passthrough, tui=args.tui,
         vad_threshold=args.vad_threshold, gate=args.gate,
         gate_hangover_ms=args.gate_hangover_ms, gate_lookahead_ms=args.gate_lookahead_ms,
@@ -289,6 +296,8 @@ class Session:
     agc: Agc | None = None
     limiter: Limiter | None = None
     recorder: RawRecorder | None = None
+    folder: Path | None = None              # the session folder, if anything is saved
+    vad: VadAnalyzer | None = None
     started: float = field(default_factory=time.monotonic)
     save_profiles: Callable = field(default=save_profiles)
     _next_health: float = 0.0
@@ -367,6 +376,8 @@ def format_status(session: Session, snap: MetricsSnapshot | None) -> str:
         return f"⚠ {MIC_SILENT_HINT}"
     speech = "SPEECH " if pipeline.ctx is not None and pipeline.ctx.is_speech else "silence"
     if engine.state != "running":
+        if engine.cfg.output_device is None:
+            return f"○ no output: recording only  {mic}  {speech}"
         return f"○ waiting for {engine.cfg.output_device!r} (asleep or disconnected)  {mic}  {speech}"
     parts = [f"● {engine.output_name}", mic, speech, _gate_label(session.gate)]
     if getattr(pipeline, "ab", False):
@@ -469,20 +480,31 @@ def load_transcriber(cfg: Config, tracker: SpeakerTracker | None, live: bool = T
     return transcriber, None
 
 
-def start_transcript(cfg: Config, transcriber: Transcriber | None, tracker: SpeakerTracker | None,
-                     source: str, suffix: str = "", stem: Path | None = None,
+def start_transcript(cfg: Config, transcriber: Transcriber | None, source: str, stem: Path | None = None,
                      recording: Path | None = None) -> UtteranceSegmenter | None:
-    """Open the transcript files (unless --no-save) and make the segmenter that feeds the transcriber."""
+    """Open the transcript files (``stem``.md/.jsonl, unless None) and make the segmenter that feeds Whisper.
+
+    Everyone is transcribed, labelled with who said it. (Transcribing only
+    the selected speaker lost about 30% of the lecturer's words whenever a
+    live label was wrong: STATUS.md.)
+    """
     if transcriber is None:
         return None
-    if cfg.save:
-        transcriber.writer = TranscriptWriter(SESSIONS_DIR, datetime.now(), source, transcriber.description,
-                                              cfg.language, suffix, stem=stem, recording=recording)
-        log.info("transcript: %s", transcriber.writer.md_path)
-    return UtteranceSegmenter(
-        transcriber.submit, selected=(lambda: tracker.selected_id) if tracker is not None else (lambda: None),
-        gap_ms=cfg.utterance_gap_ms, max_s=cfg.max_utterance_s, preroll_ms=cfg.preroll_ms,
-        min_ms=cfg.min_utterance_ms)
+    if cfg.save and stem is not None:
+        open_transcript(cfg, transcriber, source, stem, recording)
+    return make_segmenter(cfg, transcriber)
+
+
+def open_transcript(cfg: Config, transcriber: Transcriber, source: str, stem: Path,
+                    recording: Path | None = None) -> None:
+    transcriber.writer = TranscriptWriter(stem.parent, datetime.now(), source, transcriber.description,
+                                          cfg.language, stem=stem, recording=recording)
+    log.info("transcript: %s", transcriber.writer.md_path)
+
+
+def make_segmenter(cfg: Config, transcriber: Transcriber) -> UtteranceSegmenter:
+    return UtteranceSegmenter(transcriber.submit, selected=lambda: None, gap_ms=cfg.utterance_gap_ms,
+                              max_s=cfg.max_utterance_s, preroll_ms=cfg.preroll_ms, min_ms=cfg.min_utterance_ms)
 
 
 def load_denoise_model(cfg: Config):
@@ -561,7 +583,45 @@ def output_stages(cfg: Config, rate: int, blocksize: int, tracker: SpeakerTracke
     return agc, limiter
 
 
-def build_session(cfg: Config) -> Session:
+def session_models(cfg: Config, transcriber: Transcriber | None, embed_device: str | None) -> dict:
+    return {"live_asr": transcriber.description if transcriber is not None else None,
+            "speaker": f"ECAPA-TDNN ({embed_device})" if embed_device else None,
+            "denoise": "DeepFilterNet3" if cfg.denoise else None}
+
+
+SESSION_CONFIG_KEYS = ("mode", "denoise", "denoise_scope", "gate_attenuation_db", "vad_threshold", "cluster_threshold",
+                       "merge_threshold", "embed_window_s", "lookahead_ms", "buffer_ms", "asr_model", "language",
+                       "utterance_gap_ms", "attenuation_db", "boost_db")
+
+
+def session_config(cfg: Config) -> dict:
+    return {k: getattr(cfg, k) for k in SESSION_CONFIG_KEYS}
+
+
+def close_session_folder(session: Session) -> None:
+    """Mark the CLI's session folder recorded (or ready, with no audio) and list its speakers."""
+    if session.folder is None:
+        return
+    store = SessionStore(session.folder.parent)
+    sid = session.folder.name
+    speakers = session.tracker.export() if session.tracker is not None else []
+    if speakers:
+        save_speakers_npz(session.folder, speakers)
+    duration = session.recorder.seconds if session.recorder is not None else session.pipeline.media_time
+    store.update(sid, status="recorded" if session.recorder is not None else "ready", ended=now_iso(),
+                 duration_s=round(duration, 1), engine_pid=None,
+                 speakers=[{k: v for k, v in x.items() if k != "centroid"} for x in speakers])
+
+
+def save_speakers_npz(folder: Path, speakers: list[dict]) -> None:
+    """speakers.npz: ids, labels and voiceprints of a session's speakers (atomic)."""
+    tmp = folder / ".speakers.npz.tmp.npz"
+    np.savez(tmp, ids=np.array([x["id"] for x in speakers]), labels=np.array([x["label"] for x in speakers]),
+             centroids=np.stack([x["centroid"] for x in speakers]).astype(np.float32))
+    os.replace(tmp, folder / "speakers.npz")
+
+
+def build_session(cfg: Config, title: str = "", course: str = "") -> Session:
     """Load the models, start audio and the worker. Raises DeviceError if the devices can't work."""
     log.info("mode: %s", "listen (denoise, gate and level; no speaker identification, no lookahead)"
              if cfg.mode == "listen" else "full (speaker identification and per-speaker gain)")
@@ -574,15 +634,24 @@ def build_session(cfg: Config) -> Session:
     recorder = None
     try:
         engine.start()
-        stem = session_stem(SESSIONS_DIR, datetime.now())
-        if cfg.record:
-            recorder = RawRecorder(stem.parent / f"{stem.name}.wav", engine.samplerate, cfg.record_rate)
+        folder = None
+        if cfg.record or cfg.save:
+            store = SessionStore(SESSIONS_DIR)
+            info = store.create(title=title, course=course, engine_pid=os.getpid(),
+                                devices={"input": engine.input_name, "output": engine.output_name or cfg.output_device},
+                                models=session_models(cfg, transcriber, device), config=session_config(cfg))
+            folder = store.path(info["id"])
+            log.info("session folder: %s", folder)
+        if cfg.record and folder is not None:
+            recorder = RawRecorder(folder / AUDIO_FILE, engine.samplerate, cfg.record_rate)
             log.info("recording the raw mic: %s (%d kHz mono; --no-record to skip)", recorder.path,
                      cfg.record_rate // 1000)
-        segmenter = start_transcript(cfg, transcriber, tracker, f"live, {engine.input_name}", stem=stem,
+        segmenter = start_transcript(cfg, transcriber, f"live, {engine.input_name}",
+                                     stem=folder / LIVE_STEM if folder is not None else None,
                                      recording=recorder.path if recorder is not None else None)
         session = _start_processing(cfg, engine, vad, tracker, analyzer, device, segmenter, denoise_model,
                                     recorder)
+        session.folder = folder
     except BaseException:
         engine.stop()
         if recorder is not None:
@@ -594,22 +663,42 @@ def build_session(cfg: Config) -> Session:
     return session
 
 
+@dataclass
+class Stages:
+    """The playback stages of one mode, in order, and handles to the ones the UI reads."""
+    stages: list
+    gate: NoiseGate | None = None
+    speaker_gain: SpeakerGain | None = None
+    agc: Agc | None = None
+    limiter: Limiter | None = None
+
+
+def build_stages(cfg: Config, fs: int, bs: int, tracker: SpeakerTracker | None) -> Stages:
+    """Gate, speaker gain (only with a tracker), AGC, limiter; nothing with --passthrough."""
+    out = Stages(stages=[])
+    if cfg.passthrough:
+        return out
+    if cfg.gate:
+        out.gate = NoiseGate(fs, cfg.gate_attenuation_db, cfg.gate_hangover_ms, cfg.ramp_ms, cfg.gate_lookahead_ms)
+        out.stages.append(out.gate)
+    if tracker is not None:
+        out.speaker_gain = SpeakerGain(fs, tracker.gain_target, cfg.lookahead_ms, cfg.ramp_ms)
+        out.stages.append(out.speaker_gain)
+    out.agc, out.limiter = output_stages(cfg, fs, bs, tracker)
+    out.stages += [x for x in (out.agc, out.limiter) if x is not None]
+    return out
+
+
 def _start_processing(cfg: Config, engine: AudioEngine, vad: VadAnalyzer, tracker: SpeakerTracker | None,
                       analyzer: object | None, device: str | None,
                       segmenter: UtteranceSegmenter | None = None, denoise_model=None,
-                      recorder: RawRecorder | None = None) -> Session:
+                      recorder: RawRecorder | None = None, gain_tracker: SpeakerTracker | None | bool = True,
+                      ab: bool | None = None, paused: bool = False) -> Session:
+    """``gain_tracker``: the tracker the speaker-gain stage follows (True: ``tracker``; None: no speaker gain,
+    as in listen mode with speakers still identified for the transcript). ``paused`` starts on standby."""
     fs, bs = engine.samplerate, engine.blocksize
-    stages = []
-    gate = speaker_gain = agc = limiter = None
-    if not cfg.passthrough:
-        if cfg.gate:
-            gate = NoiseGate(fs, cfg.gate_attenuation_db, cfg.gate_hangover_ms, cfg.ramp_ms, cfg.gate_lookahead_ms)
-            stages.append(gate)
-        if tracker is not None:
-            speaker_gain = SpeakerGain(fs, tracker.gain_target, cfg.lookahead_ms, cfg.ramp_ms)
-            stages.append(speaker_gain)
-        agc, limiter = output_stages(cfg, fs, bs, tracker)
-        stages += [x for x in (agc, limiter) if x is not None]
+    built = build_stages(cfg, fs, bs, tracker if gain_tracker is True else gain_tracker)
+    stages, gate, speaker_gain, agc, limiter = built.stages, built.gate, built.speaker_gain, built.agc, built.limiter
     log.info("noise gate %s; speaker gain %s; AGC %s; limiter %s", "on" if gate else "off",
              f"on ({cfg.lookahead_ms:g} ms lookahead)" if speaker_gain else "off",
              f"on (target {cfg.agc_target_db:g} dBFS)" if agc else "off",
@@ -624,7 +713,8 @@ def _start_processing(cfg: Config, engine: AudioEngine, vad: VadAnalyzer, tracke
     pipeline = Pipeline(engine, cfg, analyzers=analyzers, stages=stages, highpass=highpass,
                         denoiser=denoiser, denoise_scope=cfg.denoise_scope,
                         raw_taps=[recorder] if recorder is not None else None,
-                        ab=cfg.mode == "listen" and not cfg.passthrough)
+                        ab=(cfg.mode == "listen" and not cfg.passthrough) if ab is None else ab)
+    pipeline.set_paused(paused)
     check_latency_budget(cfg, engine, pipeline, denoiser)
     # The mic has been recording while the models were set up. That backlog
     # isn't the worker falling behind: start from now instead of counting a drop.
@@ -633,7 +723,7 @@ def _start_processing(cfg: Config, engine: AudioEngine, vad: VadAnalyzer, tracke
     return Session(cfg=cfg, engine=engine, pipeline=pipeline, metrics=MetricsCollector(engine, pipeline),
                    gate=gate, speaker_gain=speaker_gain, tracker=tracker, analyzer=analyzer,
                    embed_device=device, segmenter=segmenter, denoiser=denoiser, agc=agc, limiter=limiter,
-                   recorder=recorder)
+                   recorder=recorder, vad=vad)
 
 
 def run_plain(session: Session) -> int:
@@ -771,8 +861,15 @@ def run_file(cfg: Config, path: str) -> int:
     # Only the models listen in --file mode, so "playback" scope means they get the raw audio.
     denoise_model = load_denoise_model(cfg) if cfg.denoise_scope != "playback" else None
     highpass, denoiser = make_conditioning(cfg, fs, blocksize, denoise_model)
-    segmenter = start_transcript(cfg, transcriber, tracker, f"file, {Path(path).resolve()}",
-                                 suffix=f"_{Path(path).stem}")
+    folder = None
+    if cfg.save and transcriber is not None:
+        store = SessionStore(SESSIONS_DIR)
+        info = store.create(title=Path(path).stem, status="ready", source_file=str(Path(path).resolve()),
+                            duration_s=round(total / fs, 1), models=session_models(cfg, transcriber, None),
+                            config=session_config(cfg))
+        folder = store.path(info["id"])
+    segmenter = start_transcript(cfg, transcriber, f"file, {Path(path).resolve()}",
+                                 stem=folder / LIVE_STEM if folder is not None else None)
     engine = types.SimpleNamespace(samplerate=fs, blocksize=blocksize)  # what process_block needs
     pipeline = Pipeline(engine, cfg, analyzers=[a for a in (vad, analyzer, segmenter) if a is not None],
                         highpass=highpass, denoiser=denoiser,
@@ -840,7 +937,7 @@ def log_file_summary(pipeline: Pipeline, tracker: SpeakerTracker | None, segment
         report_clips(clips)
 
 
-def run(cfg: Config, console: logging.Handler | None = None) -> int:
+def run(cfg: Config, console: logging.Handler | None = None, title: str = "", course: str = "") -> int:
     # Audio callbacks need the GIL too. Hand it over more often than the 5 ms
     # default so a busy worker can't starve them into dropouts.
     sys.setswitchinterval(0.001)
@@ -848,7 +945,7 @@ def run(cfg: Config, console: logging.Handler | None = None) -> int:
     for sig in (signal.SIGTERM, signal.SIGHUP):
         signal.signal(sig, signal.default_int_handler)
     try:
-        session = build_session(cfg)
+        session = build_session(cfg, title, course)
     except DeviceError as exc:
         log.error("%s", exc)
         return 2
@@ -881,6 +978,10 @@ def run(cfg: Config, console: logging.Handler | None = None) -> int:
                 for line in session.transcriber.drain_lines():  # the last words, finished after the UI closed
                     log.info("%s", format_line(line))
             log.info("stopped after %s", format_uptime(time.monotonic() - session.started))
+            try:
+                close_session_folder(session)
+            except Exception:  # noqa: BLE001 - the audio and transcript are saved; this is bookkeeping
+                log.exception("couldn't update the session folder")
         _hard_exit_if_needed(code, session.engine.wedged, session.transcriber)
     return code
 
@@ -894,4 +995,8 @@ def main(argv: list[str] | None = None) -> int:
     console = setup_logging(cfg.debug)
     if args.file:
         return run_file(cfg, args.file)
-    return run(cfg, console)
+    if args.output_device is not None:
+        update_settings(output_device=cfg.output_device)  # remembered for next time, here and in the app
+    if args.course:
+        update_settings(course=args.course)
+    return run(cfg, console, args.title, args.course)

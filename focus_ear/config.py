@@ -1,13 +1,16 @@
 """Runtime configuration shared by every module."""
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from pathlib import Path
 
 ANALYSIS_RATE = 16_000  # silero-vad and ECAPA-TDNN both expect 16 kHz mono
 ANALYSIS_FRAME = 512    # 32 ms at 16 kHz: silero-vad's frame size
 DATA_DIR = Path.home() / ".focus-ear"
-SESSIONS_DIR = DATA_DIR / "sessions"
+# FOCUS_EAR_SESSIONS moves the sessions elsewhere (tests, demos, an external disk).
+SESSIONS_DIR = Path(os.environ["FOCUS_EAR_SESSIONS"]).expanduser() if os.environ.get("FOCUS_EAR_SESSIONS") \
+    else DATA_DIR / "sessions"
 
 # Whisper continues the style of its prompt: spoken, code-mixed Indonesian
 # with English technical terms left in English. Measured on synthesised
@@ -44,9 +47,11 @@ class Config:
     # which applies MODE_DEFAULTS["listen"] on top.
     mode: str = "full"
 
-    # Devices: name substring or PortAudio index. None input = built-in mic.
+    # Devices: name substring or PortAudio index. None input = built-in mic;
+    # None output = play nothing (record only). The CLI and the app default
+    # to the last output chosen (settings.json), not a hard-coded name.
     input_device: str | None = None
-    output_device: str = "Mewo"
+    output_device: str | None = None
     allow_speakers: bool = False
 
     # Streams run at the mic's native rate (None) so playback keeps its full
